@@ -1,0 +1,620 @@
+Comment: >-
+  1,000 Worriers - one run. Grid (Nova Lite) -> items -> swarm (Nova Micro, Distributed Map,
+  5 worriers per request) -> tally (Lambda) -> save.
+QueryLanguage: JSONata
+StartAt: Init
+States:
+
+  Init:
+    Type: Pass
+    Assign:
+      run_id: "{% $states.context.Execution.Name %}"
+      parent_run_id: "{% $exists($states.input.parent_run_id) ? $substring($trim($string($states.input.parent_run_id)), 0, 64) : '' %}"
+      fixes: >-
+        {% $append([], $filter($append([], $states.input.accepted_fixes), function($v, $i){ $type($v) = 'string' and $length($trim($v)) > 0 and $i < 12 }).$substring($trim($), 0, 300)) %}
+      reports: >-
+        {% $append([], $filter($append([], $states.input.planner_reports), function($v, $i){ $type($v) = 'string' and $length($trim($v)) > 0 and $i < 8 }).$substring($trim($), 0, 300)) %}
+      plan: "{% $exists($states.input.plan) ? $substring($trim($string($states.input.plan)), 0, 4000) : '' %}"
+      n_req: "{% $min([$max([1, $floor($number($exists($states.input.n) ? $string($states.input.n) : '50'))]), 1000]) %}"
+      grid_tries: 0
+      tally: "{% $exists($states.input.tally) ? $substring($string($states.input.tally), 0, 8) : '' %}"
+      noise: "{% $states.input.noise = true %}"
+      revision_id: "{% $exists($states.input.revision_id) ? $substring($trim($string($states.input.revision_id)), 0, 64) : '' %}"
+      revision: null
+      lite_in: 0
+      lite_out: 0
+    Next: IsRetest
+
+  IsRetest:
+    Type: Choice
+    Choices:
+      - Condition: "{% $parent_run_id != '' %}"
+        Next: LoadParent
+    Default: CheckPlan
+
+  # ---- Re-test: same grid, same worrier list, the parent's plan plus the accepted fixes ----
+  LoadParent:
+    Type: Task
+    Resource: arn:aws:states:::dynamodb:getItem
+    Arguments:
+      TableName: ${TableName}
+      Key:
+        pk: { S: "{% 'run#' & $parent_run_id %}" }
+        sk: { S: META }
+      ConsistentRead: true
+    Assign:
+      parent: "{% $exists($states.result.Item) ? $states.result.Item : {} %}"
+    Output: {}
+    Next: HasRevision
+
+  # The canonical revision (written by the Revise workflow): the re-test reads exactly the plan the Plan Card showed.
+  HasRevision:
+    Type: Choice
+    Choices:
+      - Condition: "{% $revision_id != '' %}"
+        Next: LoadRevision
+    Default: ParentOk
+
+  LoadRevision:
+    Type: Task
+    Resource: arn:aws:states:::dynamodb:getItem
+    Arguments:
+      TableName: ${TableName}
+      Key:
+        pk: { S: "{% 'run#' & $parent_run_id %}" }
+        sk: { S: "{% 'REV#' & $revision_id %}" }
+      ConsistentRead: true
+    Assign:
+      revision: "{% $exists($states.result.Item.revision) ? $parse($states.result.Item.revision.S) : null %}"
+    Output: {}
+    Next: ParentOk
+
+  ParentOk:
+    Type: Choice
+    Choices:
+      - Condition: "{% $exists($parent.status) and $parent.status.S = 'DONE' and $revision_id != '' and $type($revision) = 'object' %}"
+        Next: SetupRetestFromRevision
+      - Condition: "{% $exists($parent.status) and $parent.status.S = 'DONE' and $revision_id = '' and ($count($fixes) > 0 or $noise = true) %}"
+        Next: SetupRetest
+    Default: BadRetest
+
+  SetupRetestFromRevision:
+    Type: Pass
+    Assign:
+      plan: "{% $substring($revision.effective_plan_text, 0, 6000) %}"
+      fixes: "{% $append([], $revision.accepted_changes.action) %}"
+      reports: "{% $append([], $revision.planner_reports.text) %}"
+      grid: "{% $parse($parent.grid.S) %}"
+      n_req: "{% $number($parent.n.N) %}"
+      n_items: "{% $number($parent.n.N) %}"
+      items_key: "{% 'results/' & $parent_run_id & '/items.json' %}"
+    Next: CreateRun
+
+  BadRetest:
+    Type: Fail
+    Error: BadInput
+    Cause: Re-test needs a finished parent run and either a saved revision (revision_id) or at least one accepted fix.
+
+  SetupRetest:
+    Type: Pass
+    Assign:
+      plan: "{% $count($fixes) > 0 ? $parent.plan.S & '\n\nChanges made to the plan:\n- ' & $join($fixes, '\n- ') : $parent.plan.S %}"
+      grid: "{% $parse($parent.grid.S) %}"
+      n_req: "{% $number($parent.n.N) %}"
+      n_items: "{% $number($parent.n.N) %}"
+      items_key: "{% 'results/' & $parent_run_id & '/items.json' %}"
+    Next: CreateRun
+
+  CheckPlan:
+    Type: Choice
+    Choices:
+      - Condition: "{% $length($plan) < 10 %}"
+        Next: BadInput
+    Default: CreateRun
+
+  BadInput:
+    Type: Fail
+    Error: BadInput
+    Cause: Plan must be at least 10 characters.
+
+  CreateRun:
+    Type: Task
+    Resource: arn:aws:states:::dynamodb:putItem
+    Arguments:
+      TableName: ${TableName}
+      Item:
+        pk: { S: "{% 'run#' & $run_id %}" }
+        sk: { S: META }
+        status: { S: "{% $parent_run_id != '' ? 'SWARM' : 'GRID' %}" }
+        n: { N: "{% $string($n_req) %}" }
+        done: { N: "0" }
+        failed: { N: "0" }
+        plan: { S: "{% $plan %}" }
+        parent_run_id: { S: "{% $parent_run_id %}" }
+        fixes: { S: "{% $string($fixes) %}" }
+        reports: { S: "{% $string($reports) %}" }
+        revision_id: { S: "{% $revision_id %}" }
+        created_at: { S: "{% $states.context.Execution.StartTime %}" }
+        ttl: { N: "{% $string($floor($toMillis($states.context.Execution.StartTime) / 1000) + 2592000) %}" }
+    Output: {}
+    Next: NeedGrid
+
+  NeedGrid:
+    Type: Choice
+    Choices:
+      - Condition: "{% $parent_run_id != '' %}"
+        Next: SaveGrid
+    Default: Grid
+
+  # ---- 1. Grid (Nova Lite): stakeholder groups taken from THIS plan, max 3 characters per group ----
+  Grid:
+    Type: Task
+    Resource: arn:aws:states:::bedrock:invokeModel
+    Arguments:
+      ModelId: ${LiteModel}
+      Body:
+        schemaVersion: messages-v1
+        system:
+          - text: >-
+              You design a pre-mortem panel for any kind of plan: personal, social, financial, travel, household or work.
+              Adapt everything to the plan you are given and use only facts stated in it.
+              Output one JSON object only, no prose, no markdown.
+        messages:
+          - role: user
+            content:
+              - text: >-
+                  {% 'Plan:\n<<<\n' & $plan & '\n>>>\n\n' &
+                  'Build a panel of 25 characters who would each notice a different risk in THIS plan.\n' &
+                  'Step 1: list the stakeholder groups that really exist in this plan: the people it names or clearly implies, ' &
+                  'their families if the plan touches them, the people who run the places and services the plan actually uses, and the public ' &
+                  'ONLY if the plan happens in a physical public place (a beach, a street, a venue); a software or online plan has no neighbours or passers-by. ' &
+                  'and the planner. Groups are people, never things such as an app or a car. Use only groups the plan really involves. Never invent a vendor, booking, service, document or cost the plan does not mention.\n' &
+                  'Step 2: put 3 characters in each group (different roles or sides within that group; fewer only if the group is a single person who cannot be seen from 3 sides), ' &
+                  'never more than 3 per group, aiming for 25 characters in total. ' &
+                  'The first group is the person most affected by the plan other than the planner, seen from up to 3 different sides ' &
+                  '(for example the same person as a very private person). Characters are witnesses: they notice risks, they never add new parts to the plan. ' &
+                  'No two characters may share the same point of view. Max 8 words each.\n' &
+                  'Step 3: angles: 11 different aspects of THIS plan that could fail, max 5 words each, no overlap. ' &
+                  'Do not include an angle about what the affected people want; that one is added separately.\n' &
+                  'Step 4: moments: exactly 5 points in TIME along this plan, in order, from preparation to the aftermath, max 6 words each ' &
+                  '(for example "a week before", "the hour before", "the main moment", "right after", "the next day", adapted to this plan). ' &
+                  'A moment is a time, never a task, object or topic.\n' &
+                  'Step 5: facts: 5 to 15 short atomic facts the plan states (who, where, when, what, dependencies), max 12 words each, in the words of the plan.\n\n' &
+                  'Return JSON exactly in this shape:\n' &
+                  '{"involves_other_people": true, "main_affected": "<role, or empty>", ' &
+                  '"groups": [{"group": "<max 5 words>", "characters": ["...", "..."]}], "angles": ["... 11 items ..."], "moments": ["..."], "facts": ["..."]}' %}
+        inferenceConfig:
+          maxTokens: 1500
+          temperature: 0.7
+    Retry:
+      - ErrorEquals: [Bedrock.ThrottlingException, Bedrock.ServiceUnavailableException, Bedrock.ModelTimeoutException, Bedrock.InternalServerException]
+        IntervalSeconds: 2
+        BackoffRate: 2
+        MaxAttempts: 6
+        JitterStrategy: FULL
+    Assign:
+      grid: >-
+        {% (
+          $b := $type($states.result.Body) = 'string' ? $parse($states.result.Body) : $states.result.Body;
+          $t := $b.output.message.content[0].text;
+          $j := $parse($match($t, /\{[\s\S]*\}/)[0].match);
+          $clean := function($xs){ $append([], $distinct($xs[$type($) = 'string' and $length($trim($)) > 0].$trim($))) };
+          $first := function($xs, $k){ $append([], $filter($xs, function($v, $i){ $i < $k })) };
+          $chars := $first($reduce($append([], $j.groups), function($acc, $g){
+            $append($acc, $first($clean($g.characters), 3).{ 'name': $, 'group': $trim($string($g.group)) })
+          }, []), 25);
+          $people := $j.involves_other_people = true or $j.involves_other_people = 'true';
+          $angles := $people
+            ? $append($first($clean($j.angles), 11), ['what the people affected actually want'])
+            : $first($clean($j.angles), 12);
+          $moments := $first($clean($j.moments), 5);
+          ($count($chars) >= 15 and $count($angles) >= 6 and $count($moments) = 5)
+            ? { 'involves_other_people': $people, 'main_affected': $string($j.main_affected),
+                'characters': $chars, 'angles': $angles, 'moments': $moments,
+                'facts': $first($clean($j.facts), 15) }
+            : $error('Grid too small')
+        ) %}
+      lite_in: "{% ($type($states.result.Body) = 'string' ? $parse($states.result.Body) : $states.result.Body).usage.inputTokens %}"
+      lite_out: "{% ($type($states.result.Body) = 'string' ? $parse($states.result.Body) : $states.result.Body).usage.outputTokens %}"
+    Output: {}
+    Catch:
+      - ErrorEquals: [States.QueryEvaluationError]
+        Assign:
+          grid_tries: "{% $grid_tries + 1 %}"
+          err: "{% $states.errorOutput %}"
+        Next: GridRetry
+      - ErrorEquals: [States.ALL]
+        Assign: { err: "{% $states.errorOutput %}" }
+        Next: MarkFailed
+    Next: BuildItems
+
+  GridRetry:
+    Type: Choice
+    Choices:
+      - Condition: "{% $grid_tries < 3 %}"
+        Next: Grid
+    Default: MarkFailed
+
+  # ---- 2. Items: shuffle the character x angle pairs; about 10% of pairs (at least 2, when it exists) use the
+  # "what the people affected actually want" angle (the affected card needs a real sub-panel); expand each pair to its 5 moments in order;
+  # cut to N. Consecutive items share a pair, so ItemBatcher(5) sends one pair per request.
+  # If the plan supports fewer than N distinct worriers, N is reduced and recorded honestly. ----
+  BuildItems:
+    Type: Pass
+    Assign:
+      # Only the chosen character x angle pair indices (<= 200 ints) live in a variable. PutItems expands them
+      # into index items {c, a, m, seq} in one $map; Express children resolve names from the grid in BatchInput.
+      # (Building 1,000 string objects with $reduce/$append exceeded the JSONata memory limit.)
+      na: "{% $count($grid.angles) %}"
+      picked: >-
+        {% (
+          $na := $count($grid.angles);
+          $nc := $count($grid.characters);
+          $wa := $grid.angles[$ = 'what the people affected actually want'] ? $na - 1 : -1;
+          $all := $shuffle([0..($nc * $na - 1)]);
+          $k := $min([$ceil($n_req / 5), $nc * $na]);
+          $wp := $all[$ % $na = $wa];
+          $op := $all[$ % $na != $wa];
+          $nw := $min([$max([2, $ceil($k / 10)]), $count($wp), $k]);
+          $shuffle($append([], $append($nw > 0 ? $wp[[0..($nw - 1)]] : [], $op[[0..($k - $nw - 1)]])))
+        ) %}
+    Next: PutItems
+
+  PutItems:
+    Type: Task
+    Resource: arn:aws:states:::aws-sdk:s3:putObject
+    Arguments:
+      Bucket: ${BucketName}
+      Key: "{% 'results/' & $run_id & '/items.json' %}"
+      # $zip + path mapping only: no per-item lambdas or computed-index predicates (both blow the JSONata memory limit at N=1,000)
+      Body: >-
+        {% $zip($append([], $picked), [0..($count($append([], $picked)) - 1)]).(
+             $p := $[0]; $pi := $[1];
+             [0, 1, 2, 3, 4].{ 'c': $floor($p / $na), 'a': $p % $na, 'm': $, 'seq': $pi * 5 + $ + 1 }
+           )[seq <= $n_req] %}
+      ContentType: application/json
+    Assign:
+      items_key: "{% 'results/' & $run_id & '/items.json' %}"
+      n_items: "{% $min([$n_req, $count($picked) * 5]) %}"
+    Output: {}
+    Catch:
+      - ErrorEquals: [States.ALL]
+        Assign: { err: "{% $states.errorOutput %}" }
+        Next: MarkFailed
+    Next: SaveGrid
+
+  SaveGrid:
+    Type: Task
+    Resource: arn:aws:states:::dynamodb:updateItem
+    Arguments:
+      TableName: ${TableName}
+      Key:
+        pk: { S: "{% 'run#' & $run_id %}" }
+        sk: { S: META }
+      UpdateExpression: "SET #s = :s, n = :n, grid = :g, items_key = :k ADD lite_in :li, lite_out :lo"
+      ExpressionAttributeNames: { "#s": status }
+      ExpressionAttributeValues:
+        ":s": { S: SWARM }
+        ":n": { N: "{% $string($n_items) %}" }
+        ":g": { S: "{% $string($grid) %}" }
+        ":k": { S: "{% $items_key %}" }
+        ":li": { N: "{% $string($lite_in) %}" }
+        ":lo": { N: "{% $string($lite_out) %}" }
+    Output: {}
+    Catch:
+      - ErrorEquals: [States.ALL]
+        Assign: { err: "{% $states.errorOutput %}" }
+        Next: MarkFailed
+    Next: Swarm
+
+  # ---- 3. Swarm: each Nova Micro request carries five worriers (one character+angle, 5 moments) ----
+  Swarm:
+    Type: Map
+    ItemReader:
+      Resource: arn:aws:states:::s3:getObject
+      ReaderConfig:
+        InputType: JSON
+      Arguments:
+        Bucket: ${BucketName}
+        Key: "{% $items_key %}"
+    ItemBatcher:
+      MaxItemsPerBatch: 5
+      BatchInput:
+        run_id: "{% $run_id %}"
+        plan: "{% $plan %}"
+        grid: "{% $grid %}"
+    # 200 requests for 1,000 worriers; 6 in flight at ~2-3 s each stays under the 200 RPM quota.
+    MaxConcurrency: 6
+    ToleratedFailurePercentage: 10
+    ItemProcessor:
+      ProcessorConfig:
+        Mode: DISTRIBUTED
+        ExecutionType: EXPRESS
+      StartAt: Worry
+      States:
+        Worry:
+          Type: Task
+          QueryLanguage: JSONata
+          Resource: arn:aws:states:::bedrock:invokeModel
+          Arguments:
+            ModelId: ${MicroModel}
+            Body:
+              schemaVersion: messages-v1
+              system:
+                - text: >-
+                    You are a worrier on a pre-mortem panel. You imagine concrete, realistic failures, exactly ONE per case.
+                    Each failure is a STATEMENT, never a question: one full sentence of 8 to 25 words saying who or what
+                    fails, how, and what it causes (not a headline, not a list).
+                    Use only facts stated in the plan. Your character is a witness who notices what could go wrong;
+                    never invent a new person, vendor, booking, purchase, fee, document or other dependency the plan does not mention.
+                    Before answering, check every failure: each person, place, vehicle, room, shop, booking, item and cost in it
+                    must appear in the plan. If it does not, replace that failure with one that uses only the plan.
+                    Output one JSON object only, no prose, no markdown.
+              messages:
+                - role: user
+                  content:
+                    - text: >-
+                        {% (
+                          $its := $append([], $states.input.Items.( $it := $; $exists($it.character) ? $it : {
+                            'seq': $it.seq, 'character': $states.input.BatchInput.grid.characters[$it.c].name,
+                            'group': $states.input.BatchInput.grid.characters[$it.c].group,
+                            'angle': $states.input.BatchInput.grid.angles[$it.a], 'moment': $states.input.BatchInput.grid.moments[$it.m] } ));
+                          $k := $count($its);
+                          $uniform := $count($distinct($its.(character & '|' & angle))) = 1;
+                          $head := $uniform
+                            ? 'You are ' & $its[0].character & '. Your angle is "' & $its[0].angle & '": every failure you imagine must come through that angle, ' &
+                              'as seen from your position, and not through anything else in the plan.\n'
+                            : 'Each numbered case gives a character, an angle and a moment. Take the view of that character; the failure must come through that angle.\n';
+                          $cases := $join($map($its, function($v, $i){
+                            $uniform ? (($i + 1) & '. At "' & $v.moment & '": one thing that goes wrong through "' & $v.angle & '".')
+                                     : (($i + 1) & '. You are ' & $v.character & ', looking only at "' & $v.angle & '", at the moment "' & $v.moment & '"')
+                          }), '\n');
+                          $head & 'Plan: ' & $states.input.BatchInput.plan & '\n\n' &
+                          'For EACH case below, imagine ONE specific, realistic way the plan goes wrong at that point. ' &
+                          'The failures must differ from each other and avoid the obvious generic risks. Use only what the plan says; ' &
+                          'your character only notices, it is not part of the plan unless the plan says so.\n' &
+                          ('what the people affected actually want' in $its.angle
+                            ? 'For the angle "what the people affected actually want": the failure is that the plan goes against what the person most affected wants, feels or would choose (their wishes, comfort, privacy, consent), not a logistics problem.\n'
+                            : '') &
+                          'Write each failure as ONE statement (never a question), a full sentence of 8 to 25 words.\n' &
+                          'For each failure also give "quotes": 1 or 2 short phrases copied word for word from the plan that it depends on, ' &
+                          'and "missing": a fact the plan leaves out that this failure depends on, for example "who tells support" or "whether the restore was tested" (or "" if none).\n' & $cases & '\n\n' &
+                          'Return JSON {"worries": [{"n": 1, "failure": "<one full sentence, 8-25 words, a statement>", "quotes": ["<exact plan words, max 8 words>"], ' &
+                          '"missing": "<max 10 words>", "severity": <1-5>, "early_sign": "<max 15 words>", ' &
+                          '"cause": "<2-4 words, lowercase, the root cause as a generic noun phrase, e.g. surprise leak, bad weather>"}]} ' &
+                          'with exactly ' & $k & ' entries in the same order as the cases.'
+                        ) %}
+              inferenceConfig:
+                maxTokens: "{% 150 * $count($states.input.Items) %}"
+                temperature: 0.9
+          Retry:
+            - ErrorEquals: [Bedrock.ThrottlingException, Bedrock.ServiceUnavailableException, Bedrock.ModelTimeoutException, Bedrock.InternalServerException]
+              IntervalSeconds: 2
+              BackoffRate: 2
+              MaxAttempts: 6
+              JitterStrategy: FULL
+            - ErrorEquals: [States.QueryEvaluationError]
+              IntervalSeconds: 1
+              MaxAttempts: 1
+          Output: >-
+            {% (
+              $b := $type($states.result.Body) = 'string' ? $parse($states.result.Body) : $states.result.Body;
+              $t := $b.output.message.content[0].text;
+              $ws := $append([], $parse($match($t, /\{[\s\S]*\}/)[0].match).worries);
+              $its := $append([], $states.input.Items.( $it := $; $exists($it.character) ? $it : {
+                            'seq': $it.seq, 'character': $states.input.BatchInput.grid.characters[$it.c].name,
+                            'group': $states.input.BatchInput.grid.characters[$it.c].group,
+                            'angle': $states.input.BatchInput.grid.angles[$it.a], 'moment': $states.input.BatchInput.grid.moments[$it.m] } ));
+              $ok := $append([], $map($its, function($it, $i){ (
+                $w := $ws[$i];
+                $f := $trim($string($w.failure));
+                $sv := $match($string($w.severity), /[1-5]/);
+                ($exists($w) and $length($f) > 0 and $exists($sv))
+                  ? { 'item': $it, 'failure': $f, 'severity': $number($sv[0].match), 'early_sign': $trim($string($w.early_sign)),
+                      'quotes': $string($append([], $filter($append([], $w.quotes), function($q, $j){ $type($q) = 'string' and $length($trim($q)) > 0 and $j < 2 }).$substring($trim($), 0, 80))),
+                      'missing': $substring($trim($exists($w.missing) ? $string($w.missing) : ''), 0, 120),
+                      'cause': $lowercase($substring($trim($exists($w.cause) ? $string($w.cause) : ''), 0, 60)) }
+              ) }));
+              $count($ok) = 0 ? $error('no usable worries') : {
+                'run_id': $states.input.BatchInput.run_id,
+                'ok': $ok,
+                'bad': $count($its) - $count($ok),
+                'in': $b.usage.inputTokens,
+                'out': $b.usage.outputTokens,
+                'tries': 0
+              }
+            ) %}
+          Catch:
+            - ErrorEquals: [States.ALL]
+              Output: "{% $states.input %}"
+              Next: CountFail
+          Next: SaveWorries
+
+        # Each worry is still its own DynamoDB item.
+        SaveWorries:
+          Type: Task
+          QueryLanguage: JSONata
+          Resource: arn:aws:states:::aws-sdk:dynamodb:batchWriteItem
+          Arguments:
+            RequestItems: >-
+              {% { '${TableName}': $map($states.input.ok, function($w){ { 'PutRequest': { 'Item': {
+                'pk': { 'S': 'run#' & $states.input.run_id },
+                'sk': { 'S': 'W#' & $formatNumber($w.item.seq, '0000') },
+                'seq': { 'N': $string($w.item.seq) },
+                'character': { 'S': $w.item.character },
+                'group': { 'S': $w.item.group },
+                'angle': { 'S': $w.item.angle },
+                'moment': { 'S': $w.item.moment },
+                'failure': { 'S': $w.failure },
+                'severity': { 'N': $string($w.severity) },
+                'early_sign': { 'S': $w.early_sign },
+                'cause': { 'S': $w.cause },
+                'quotes': { 'S': $w.quotes },
+                'missing': { 'S': $w.missing }
+              } } } }) } %}
+          Retry:
+            - ErrorEquals: [DynamoDB.ProvisionedThroughputExceededException, DynamoDB.ThrottlingException, DynamoDB.InternalServerErrorException]
+              IntervalSeconds: 1
+              BackoffRate: 2
+              MaxAttempts: 5
+          Output: >-
+            {% $merge([$states.input, { 'unprocessed': $states.result.UnprocessedItems }]) %}
+          Next: AllWritten
+
+        AllWritten:
+          Type: Choice
+          QueryLanguage: JSONata
+          Choices:
+            - Condition: "{% $count($keys($states.input.unprocessed)) > 0 and $states.input.tries < 4 %}"
+              Next: WriteLeftovers
+          Default: Bump
+
+        WriteLeftovers:
+          Type: Task
+          QueryLanguage: JSONata
+          Resource: arn:aws:states:::aws-sdk:dynamodb:batchWriteItem
+          Arguments:
+            RequestItems: "{% $states.input.unprocessed %}"
+          Output: >-
+            {% $merge([$states.input, { 'unprocessed': $states.result.UnprocessedItems, 'tries': $states.input.tries + 1 }]) %}
+          Next: AllWritten
+
+        Bump:
+          Type: Task
+          QueryLanguage: JSONata
+          Resource: arn:aws:states:::dynamodb:updateItem
+          Arguments:
+            TableName: ${TableName}
+            Key:
+              pk: { S: "{% 'run#' & $states.input.run_id %}" }
+              sk: { S: META }
+            UpdateExpression: "ADD done :d, failed :f, micro_in :i, micro_out :o, micro_calls :one"
+            ExpressionAttributeValues:
+              ":d": { N: "{% $string($count($states.input.ok)) %}" }
+              ":f": { N: "{% $string($states.input.bad) %}" }
+              ":i": { N: "{% $string($states.input.in) %}" }
+              ":o": { N: "{% $string($states.input.out) %}" }
+              ":one": { N: "1" }
+          Output: "{% { 'saved': $count($states.input.ok), 'bad': $states.input.bad } %}"
+          End: true
+
+        CountFail:
+          Type: Task
+          QueryLanguage: JSONata
+          Resource: arn:aws:states:::dynamodb:updateItem
+          Arguments:
+            TableName: ${TableName}
+            Key:
+              pk: { S: "{% 'run#' & $states.input.BatchInput.run_id %}" }
+              sk: { S: META }
+            UpdateExpression: "ADD failed :k, micro_calls :one"
+            ExpressionAttributeValues:
+              ":k": { N: "{% $string($count($states.input.Items)) %}" }
+              ":one": { N: "1" }
+          Next: WorryFailed
+
+        WorryFailed:
+          Type: Fail
+          QueryLanguage: JSONata
+          Error: WorryFailed
+          Cause: The worrier request failed or returned unusable JSON.
+    ResultWriter:
+      Resource: arn:aws:states:::s3:putObject
+      Arguments:
+        Bucket: ${BucketName}
+        Prefix: "{% 'results/' & $run_id %}"
+    Output: {}
+    Catch:
+      - ErrorEquals: [States.ALL]
+        Assign: { err: "{% $states.errorOutput %}" }
+        Next: MarkFailed
+    Next: MarkTally
+
+  MarkTally:
+    Type: Task
+    Resource: arn:aws:states:::dynamodb:updateItem
+    Arguments:
+      TableName: ${TableName}
+      Key:
+        pk: { S: "{% 'run#' & $run_id %}" }
+        sk: { S: META }
+      UpdateExpression: "SET #s = :s"
+      ExpressionAttributeNames: { "#s": status }
+      ExpressionAttributeValues: { ":s": { S: TALLY } }
+    Output: {}
+    Next: Tally
+
+  # ---- 4. Tally: themes, classification, counts in code, fixes (one Lambda) ----
+  Tally:
+    Type: Task
+    Resource: arn:aws:states:::lambda:invoke
+    Arguments:
+      FunctionName: ${TallyFunctionArn}
+      Payload:
+        run_id: "{% $run_id %}"
+        plan: "{% $plan %}"
+        parent_run_id: "{% $parent_run_id %}"
+        tally: "{% $tally %}"
+        noise: "{% $noise = true %}"
+        reports: "{% $reports %}"
+        revision: "{% $revision %}"
+    TimeoutSeconds: 600
+    Retry:
+      - ErrorEquals: [Lambda.ServiceException, Lambda.AWSLambdaException, Lambda.SdkClientException, Lambda.TooManyRequestsException]
+        IntervalSeconds: 2
+        BackoffRate: 2
+        MaxAttempts: 3
+    Assign:
+      tally: "{% $states.result.Payload %}"
+    Output: {}
+    Catch:
+      - ErrorEquals: [States.ALL]
+        Assign: { err: "{% $states.errorOutput %}" }
+        Next: MarkFailed
+    Next: Save
+
+  # ---- 5. Save ----
+  Save:
+    Type: Task
+    Resource: arn:aws:states:::dynamodb:updateItem
+    Arguments:
+      TableName: ${TableName}
+      Key:
+        pk: { S: "{% 'run#' & $run_id %}" }
+        sk: { S: META }
+      UpdateExpression: >-
+        SET #s = :s, #r = :r, themes = :t, labels = :l, finished_at = :f
+        ADD lite_in :li, lite_out :lo, pro_in :pi, pro_out :po
+      ExpressionAttributeNames: { "#s": status, "#r": result }
+      ExpressionAttributeValues:
+        ":s": { S: DONE }
+        ":r": { S: "{% $string($tally.result) %}" }
+        ":t": { S: "{% $string($tally.themes) %}" }
+        ":l": { S: "{% $string($tally.labels) %}" }
+        ":f": { S: "{% $states.context.State.EnteredTime %}" }
+        ":li": { N: "{% $string($tally.tokens.lite_in) %}" }
+        ":lo": { N: "{% $string($tally.tokens.lite_out) %}" }
+        ":pi": { N: "{% $string($tally.tokens.pro_in) %}" }
+        ":po": { N: "{% $string($tally.tokens.pro_out) %}" }
+    Output: "{% { 'run_id': $run_id, 'top5': $tally.result.top5.{ 'theme': name, 'count': count } } %}"
+    End: true
+
+  MarkFailed:
+    Type: Task
+    Resource: arn:aws:states:::dynamodb:updateItem
+    Arguments:
+      TableName: ${TableName}
+      Key:
+        pk: { S: "{% 'run#' & $run_id %}" }
+        sk: { S: META }
+      UpdateExpression: "SET #s = :s, #e = :e"
+      ExpressionAttributeNames: { "#s": status, "#e": error }
+      ExpressionAttributeValues:
+        ":s": { S: FAILED }
+        ":e": { S: "{% $substring($string($err), 0, 2000) %}" }
+    Next: RunFailed
+
+  RunFailed:
+    Type: Fail
+    Error: RunFailed
+    Cause: See the run's META error attribute.

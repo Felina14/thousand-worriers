@@ -1,0 +1,86 @@
+Comment: >-
+  1,000 Worriers - reminders. Express, called synchronously by POST /runs/{id}/reminders.
+  Each chosen early sign becomes a one-time EventBridge Scheduler schedule whose target is
+  SES SendEmail (universal target). The schedule deletes itself after it fires. No Lambda.
+QueryLanguage: JSONata
+StartAt: Validate
+States:
+
+  Validate:
+    Type: Pass
+    Assign:
+      run_id: "{% $substring($states.context.Execution.Name, 0, 36) %}"
+      tag: "{% $substring($states.context.Execution.Name, $length($states.context.Execution.Name) - 6) %}"
+      email: "{% $exists($states.input.email) ? $trim($string($states.input.email)) : '' %}"
+      now: "{% $toMillis($states.context.Execution.StartTime) %}"
+      items: >-
+        {% $append([], $filter($append([], $states.input.reminders), function($r, $i){
+             $i < 6 and $type($r) = 'object' and $exists($r.at) and $exists($r.text)
+           })) %}
+    Next: Check
+
+  Check:
+    Type: Choice
+    Choices:
+      - Condition: >-
+          {% $not($contains($email, /^[^@\s]{1,64}@[^@\s]{1,190}\.[a-zA-Z]{2,}$/))
+             or $count($items) = 0
+             or $count($items[$toMillis($string(at)) < $now + 60000 or $toMillis($string(at)) > $now + 400 * 86400000]) > 0 %}
+        Next: BadRequest
+    Default: Schedule
+
+  BadRequest:
+    Type: Fail
+    Error: BadRequest
+    Cause: Need a valid email and 1 to 6 reminders, each at least a minute and at most 400 days ahead.
+
+  Schedule:
+    Type: Map
+    Items: "{% $items %}"
+    ItemSelector:
+      run_id: "{% $run_id %}"
+      tag: "{% $tag %}"
+      email: "{% $email %}"
+      i: "{% $states.context.Map.Item.Index %}"
+      r: "{% $states.context.Map.Item.Value %}"
+    ItemProcessor:
+      ProcessorConfig:
+        Mode: INLINE
+      StartAt: CreateSchedule
+      States:
+        CreateSchedule:
+          Type: Task
+          Resource: arn:aws:states:::aws-sdk:scheduler:createSchedule
+          Arguments:
+            Name: "{% 'tw-' & $substring($states.input.run_id, 0, 8) & '-' & $states.input.tag & '-' & $states.input.i %}"
+            ScheduleExpression: "{% 'at(' & $fromMillis($toMillis($string($states.input.r.at)), '[Y0001]-[M01]-[D01]T[H01]:[m01]:[s01]') & ')' %}"
+            ScheduleExpressionTimezone: UTC
+            FlexibleTimeWindow:
+              Mode: "OFF"
+            ActionAfterCompletion: DELETE
+            Description: "{% $substring('1,000 Worriers reminder: ' & $string($states.input.r.text), 0, 500) %}"
+            Target:
+              Arn: arn:aws:scheduler:::aws-sdk:sesv2:sendEmail
+              RoleArn: ${SchedulerRoleArn}
+              RetryPolicy:
+                MaximumRetryAttempts: 3
+                MaximumEventAgeInSeconds: 3600
+              Input: >-
+                {% $string({
+                  'FromEmailAddress': 'Thousand Worriers <${SenderEmail}>',
+                  'Destination': { 'ToAddresses': [$states.input.email] },
+                  'Content': { 'Simple': {
+                    'Subject': { 'Data': $substring('Time to check: ' & $string($states.input.r.text), 0, 120) },
+                    'Body': { 'Text': { 'Data':
+                      'Hello from 1,000 Worriers.\n\n' &
+                      'You asked to be reminded to check this early warning sign:\n\n    ' & $string($states.input.r.text) & '\n\n' &
+                      ($exists($states.input.r.fix) and $string($states.input.r.fix) != '' ? 'The fix you chose for it:\n\n    ' & $string($states.input.r.fix) & '\n\n' : '') &
+                      'If you notice the sign, your backup plan is on the calm-plan page of your run.\n\n' &
+                      'Worriers are angles on your plan, not people. This reminder was scheduled once and deletes itself after sending.'
+                    } }
+                  } }
+                }) %}
+          Output: "{% { 'at': $states.input.r.at, 'text': $states.input.r.text } %}"
+          End: true
+    Output: "{% { 'scheduled': $states.result } %}"
+    End: true

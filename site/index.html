@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#0B0820">
+  <title>1,000 Worriers</title>
+  <meta name="description" content="Type any plan. A stage of worriers each imagines one way it goes wrong; you get the top five, with real counts and fixes.">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cdefs%3E%3CradialGradient id='g' cx='.35' cy='.3'%3E%3Cstop offset='0' stop-color='%23FFB3DA'/%3E%3Cstop offset='.5' stop-color='%23FF4FA3'/%3E%3Cstop offset='1' stop-color='%23A21C6B'/%3E%3C/radialGradient%3E%3C/defs%3E%3Ccircle cx='16' cy='17' r='13' fill='url(%23g)'/%3E%3Ccircle cx='11.5' cy='15' r='2' fill='%231B1035'/%3E%3Ccircle cx='20.5' cy='15' r='2' fill='%231B1035'/%3E%3Cpath d='M11 21 q5 4 10 0' stroke='%231B1035' stroke-width='2.2' fill='none' stroke-linecap='round'/%3E%3C/svg%3E">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@600;700;800&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css?v=63">
+</head>
+<body data-ph="compose">
+  <div class="aurora" aria-hidden="true"><i class="a1"></i><i class="a2"></i><i class="a3"></i></div>
+  <div class="stardust" aria-hidden="true"></div>
+
+  <div class="app">
+    <header class="topbar">
+      <div class="logo">
+        <span class="wordmark">1,000 Worriers</span>
+        <span class="tag">They worry, so you don't.</span>
+      </div>
+      <div class="tools">
+        <button id="sound" class="icon-btn" type="button" aria-pressed="false" aria-label="Sound effects" title="Sound effects">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9v6h4l5 4V5L8 9H4z" fill="currentColor"/><path class="waves" d="M16.5 8.5a5 5 0 010 7M19 6a8.5 8.5 0 010 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path class="mute" d="M16 9l5 6M21 9l-5 6" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+        </button>
+        <button id="info" class="icon-btn" type="button" aria-expanded="false" aria-controls="info-pop" aria-label="How to read these numbers">i</button>
+        <div id="info-pop" class="info-pop glass-strong" role="dialog" aria-label="Honesty note" hidden>
+          <b>How to read this</b>
+          <p>Each worrier is one character × one angle × one moment, imagined by Amazon Nova. Angles, not people. Group sizes show similar wording, not agreement or probability.</p>
+          <p>AI generates, maths decides: one Nova Micro request carries five worriers; counting happens in code; worries about things your plan never mentions get set aside. It's a planning aid, not professional advice.</p>
+        </div>
+      </div>
+    </header>
+
+    <!-- LEFT RAIL -->
+    <aside class="rail rail-left">
+      <section id="compose" class="glass compose" aria-label="Your plan">
+        <label class="lbl" for="plan">What's the plan?</label>
+        <textarea id="plan" maxlength="4000" placeholder="Tell it like you'd tell a friend. Who, where, when, and what absolutely has to go right."></textarea>
+        <div class="chips" role="group" aria-label="Example plans">
+          <button type="button" class="chip" data-demo="proposal">💍 Proposal</button>
+          <button type="button" class="chip" data-demo="cutover">🏢 Prod cutover</button>
+          <button type="button" class="chip" data-demo="launch">🚀 Product launch</button>
+          <button type="button" class="chip" data-demo="nightout">🎉 Night out</button>
+          <button type="button" class="chip" data-demo="purchase">🚗 Big purchase</button>
+          <button type="button" class="chip" data-demo="trip">✈️ Trip</button>
+          <button type="button" class="chip" data-demo="monsoon">🌧️ Monsoon week</button>
+          <button type="button" class="chip" data-demo="breakup">💔 Breakup talk</button>
+        </div>
+        <div class="lbl" id="count-lbl">Crowd size</div>
+        <div class="toggle" role="radiogroup" aria-labelledby="count-lbl" style="--i:1">
+          <span class="thumb" aria-hidden="true"></span>
+          <button type="button" role="radio" aria-checked="false" data-n="20">20</button>
+          <button type="button" role="radio" aria-checked="true" data-n="100">100</button>
+          <button type="button" role="radio" aria-checked="false" data-n="1000">1,000</button>
+        </div>
+        <button id="go" class="summon" type="button"><span>Summon the worriers</span></button>
+        <p id="plan-msg" class="msg" role="alert" hidden></p>
+        <ol class="howto" aria-label="How the show works">
+          <li><span>🎭</span><p>A cast built for <em>your</em> plan</p></li>
+          <li><span>😱</span><p>Each one finds one way it breaks</p></li>
+          <li><span>🤝</span><p>They huddle. The maths counts.</p></li>
+          <li><span>🔧</span><p>You fix. They look again.</p></li>
+        </ol>
+      </section>
+
+      <section id="fixpanel" class="glass fixpanel" aria-label="What the worriers found" hidden>
+        <div class="fp-head">
+          <h2>What they found</h2>
+          <button id="new-plan" class="linkish" type="button">New plan</button>
+        </div>
+        <p class="fp-sub" id="rv-sub"></p>
+        <div id="rv-list" class="rv-list"></div>
+        <div id="rv-detail" class="rv-detail" hidden></div>
+        <div class="rv-foot">
+          <p id="rv-count" class="rv-count"></p>
+          <button id="retest" class="summon calm" type="button" disabled><span>Build my revised plan</span></button>
+          <p id="retest-msg" class="msg" role="alert" hidden></p>
+        </div>
+      </section>
+    </aside>
+
+    <!-- STAGE -->
+    <main class="stage glass" id="stage" aria-label="The Worry Theatre">
+      <div class="status-chip"><i class="live"></i><span id="status">Ready when you are</span></div>
+      <canvas id="cv" aria-hidden="true"></canvas>
+      <div id="layer" class="layer" aria-hidden="true"></div>
+      <div id="cards" class="cast-cards" aria-hidden="true"></div>
+      <div id="empty" class="empty"><p>Give them something to worry about.</p><span>A thousand worriers, fast asleep. Wake them with a plan.</span></div>
+      <div id="spot" class="spot" hidden><div class="cone wide"></div><div class="cone"></div><div class="pool"></div></div>
+      <div id="quiet" class="quiet" hidden>
+        <p class="q-eyebrow" id="q-eyebrow">The quiet worry</p>
+        <p class="q-text" id="q-text"></p>
+        <p class="q-worry" id="q-worry"></p>
+        <p class="q-also" id="q-also" hidden></p>
+        <div class="q-actions">
+          <button id="q-matters" class="pill pill-hot" type="button">That one matters</button>
+          <button id="q-skip" class="pill" type="button">Show me the fixes</button>
+        </div>
+      </div>
+      <div id="results" class="results glass-strong" hidden></div>
+      <div id="calm" class="calmcard glass-strong" hidden></div>
+      <div id="hover" class="hover glass-strong" hidden></div>
+    </main>
+
+    <!-- RIGHT RAIL -->
+    <aside class="rail rail-right">
+      <section class="glass meter" aria-label="Worry-o-meter">
+        <h2>Worry-o-meter</h2>
+        <svg viewBox="0 0 220 130" class="gauge" aria-hidden="true">
+          <defs>
+            <linearGradient id="g-arc" x1="0" x2="1"><stop offset="0" stop-color="#2EE6A8"/><stop offset=".5" stop-color="#FACC15"/><stop offset="1" stop-color="#FF3D71"/></linearGradient>
+            <filter id="glow" x="-50%" y="-50%" width="200%" height="200%"><feGaussianBlur stdDeviation="4" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+          </defs>
+          <path d="M22 112 A88 88 0 0 1 198 112" fill="none" stroke="rgba(255,255,255,.08)" stroke-width="14" stroke-linecap="round"/>
+          <path d="M22 112 A88 88 0 0 1 198 112" fill="none" stroke="url(#g-arc)" stroke-width="7" stroke-linecap="round" filter="url(#glow)"/>
+          <g id="needle" style="transform-origin:110px 112px">
+            <path d="M108 112 L110 36 L112 112 Z" fill="#F5F3FF" filter="url(#glow)"/>
+          </g>
+          <circle cx="110" cy="112" r="7" fill="#0B0820" stroke="#F5F3FF" stroke-width="2.5"/>
+          <text x="22" y="128" class="g-lbl" text-anchor="middle">calm</text><text x="198" y="128" class="g-lbl" text-anchor="middle">panic</text>
+        </svg>
+        <p class="meter-num"><span id="m-done">0</span><span class="slash">/</span><span id="m-n">0</span></p>
+        <p class="meter-what" id="m-what">have spoken</p>
+        <p class="meter-sub" id="m-sub">Waiting for a plan.</p>
+      </section>
+      <section class="glass stats" aria-label="Live stats">
+        <div class="stat"><b id="s-calls">0</b><span>Nova requests</span></div>
+        <div class="stat"><b id="s-landed">0</b><span>worries landed</span></div>
+        <div class="stat wide"><b id="s-top">–</b><span id="s-top-lbl">loudest angle so far</span></div>
+        <div class="stat"><b id="s-time">0:00</b><span>run time</span></div>
+      </section>
+      <section class="glass tick" aria-label="Live worries">
+        <h2>Live worries</h2>
+        <ol id="ticker" class="ticker" aria-live="polite"></ol>
+      </section>
+    </aside>
+
+    <footer class="honesty">Worriers are angles, not people. Group sizes show similar wording, not agreement or probability. A planning tool, not advice. Use non-sensitive plans.</footer>
+  </div>
+  <canvas id="fx" class="fx" aria-hidden="true"></canvas>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/gsap/3.12.5/gsap.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js" defer></script>
+  <script src="creatures.js?v=52"></script>
+  <script src="app.js?v=63"></script>
+</body>
+</html>

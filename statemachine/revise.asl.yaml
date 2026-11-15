@@ -1,0 +1,229 @@
+Comment: >-
+  1,000 Worriers - the canonical revision. Express, called synchronously by POST /runs/{id}/revise after the planner
+  decides. Builds ONE typed ledger (original plan, accepted changes, exact superseded lines, open questions, planner
+  reports, conflicts, effective_plan_text) and stores it as run#<id> / REV#<revision_id>. The Plan Card renders this
+  ledger and the re-test loads it by revision_id, so the plan shown and the plan re-tested are the same text.
+  One Nova Pro call only orders the changes, names numeric updates and lists conflicts; code builds every text.
+  Open questions and planner reports are kept apart: they are never written into the plan as safeguards. No Lambda.
+QueryLanguage: JSONata
+StartAt: Validate
+States:
+
+  Validate:
+    Type: Pass
+    Assign:
+      run_id: "{% $substring($states.context.Execution.Name, 0, 36) %}"
+      revision_id: "{% $substring($states.context.Execution.Name, 37) %}"
+      changes: >-
+        {% $append([], $filter($append([], $states.input.changes), function($v, $i){ $type($v) = 'string' and $length($trim($v)) > 0 and $i < 12 }).$substring($trim($), 0, 300)) %}
+      checks: >-
+        {% $append([], $filter($append([], $states.input.checks), function($v, $i){ $type($v) = 'string' and $length($trim($v)) > 0 and $i < 12 }).$substring($trim($), 0, 300)) %}
+      reports: >-
+        {% $append([], $filter($append([], $states.input.reports), function($v, $i){ $type($v) = 'string' and $length($trim($v)) > 0 and $i < 8 }).$substring($trim($), 0, 300)) %}
+    Next: Check
+
+  Check:
+    Type: Choice
+    Choices:
+      - Condition: "{% $count($changes) + $count($checks) = 0 %}"
+        Next: BadRequest
+    Default: LoadRun
+
+  BadRequest:
+    Type: Fail
+    Error: BadRequest
+    Cause: Need at least one accepted change or planned check.
+
+  LoadRun:
+    Type: Task
+    Resource: arn:aws:states:::dynamodb:getItem
+    Arguments:
+      TableName: ${TableName}
+      Key:
+        pk: { S: "{% 'run#' & $run_id %}" }
+        sk: { S: META }
+    Assign:
+      plan: "{% $exists($states.result.Item.status) and $states.result.Item.status.S = 'DONE' ? $states.result.Item.plan.S : '' %}"
+    Next: RunOk
+
+  RunOk:
+    Type: Choice
+    Choices:
+      - Condition: "{% $length($plan) = 0 %}"
+        Next: NoRun
+    Default: Split
+
+  Split:
+    Type: Pass
+    Comment: >-
+      The original plan as numbered sentences, shown first and word for word. Nova Pro only orders the change and check ids,
+      and an update (a change that alters a stated number or time) counts only if its old and new words check out in code;
+      run d9db470a lost four of six plan facts when the model rewrote the plan itself.
+    Assign:
+      items: >-
+        {% (
+          $sents := $append([], $filter($append([], $split($plan, '. ')).$trim($), function($v, $i){ $length($v) > 0 and $i < 20 }));
+          $append($append(
+            $map($sents, function($v, $i){ { 'id': 'P' & ($i + 1), 'text': ($substring($v, -1) in ['.', '!', '?'] ? $v : $v & '.'), 'changed': false } }),
+            $map($changes, function($v, $i){ (
+              $t := ($lowercase($substring($v, 0, 3)) = 'me:' ? $trim($substring($v, 3)) : $lowercase($substring($v, 0, 2)) = 'i:' ? $trim($substring($v, 2)) : $v);
+              { 'id': 'C' & ($i + 1), 'text': $uppercase($substring($t, 0, 1)) & $substring($t, 1), 'changed': true } ) })),
+            $map($checks, function($v, $i){ { 'id': 'K' & ($i + 1), 'text': $trim($replace($v, /^find out( before the day)?\s*:\s*/i, '')), 'changed': true } }))
+        ) %}
+    Next: Revise
+
+  NoRun:
+    Type: Fail
+    Error: BadRequest
+    Cause: The run is not finished or does not exist.
+
+  Revise:
+    Type: Task
+    Resource: arn:aws:states:::bedrock:invokeModel
+    Arguments:
+      ModelId: ${ProModelId}
+      Body:
+        schemaVersion: messages-v1
+        system:
+          - text: >-
+              You are a practical, kind and honest planning advisor. You merge decided changes into a plan and point out
+              real conflicts. Never deceive, mislead or pressure anyone, and never invent cover stories or false reasons.
+              Output one JSON object only, no prose, no markdown.
+        messages:
+          - role: user
+            content:
+              - text: >-
+                  {% 'Items, each with an id. P = a sentence of the original plan. C = a change the planner accepted (planned, NOT done yet). '
+                     & 'K = an open question the planner will look into (NOT a safeguard, NOT done).\n' &
+                     $join($items.(id & ': ' & text), '\n') & '\n\n' &
+                     'order: the C and K ids in the order the planner should do them before the plan goes ahead. Use every C and K id exactly once.\n' &
+                     'updates: a change that makes a P sentence UNTRUE as written, because it replaces a number, time, person, place or step '
+                     & 'that the sentence states (e.g. "twelve friends" becomes "six friends", "24 hours" becomes "36 hours"), as {"p": "<P id>", "c": "<C id>", "old": "<words copied from the P sentence>", "new": "<words copied from the change>"}. '
+                     & 'A change that only adds a step, a check or a message next to a sentence is NOT an update. Most plans have no updates. '
+                     & 'An update is expected, not a conflict.\n' &
+                     'conflicts: two items that cannot BOTH happen as written: the same moment for one person, the wrong order, a check '
+                     & 'that needs something another item stops, two changes that undo each other, or two changes that act on the same thing in '
+                     & 'opposite directions (e.g. one clears a cache and another extends it) when no order between them is stated. Items done at different moments '
+                     & 'before the main event do NOT conflict, and an update is NOT a conflict. List only real conflicts, or [].\n' &
+                     'questions: when two changes act on the same thing and could work together only in a certain order or way that the '
+                     & 'items do not state, one short question for the planner (max 20 words), e.g. "Is the guest list final before the '
+                     & 'invitations are printed?". Do not invent a conflict for this. [] if none.\n' &
+                     'Return JSON {"order": ["C2", "K1", "C1"], "updates": [{"p": "P3", "c": "C1", "old": "twelve friends", "new": "six friends"}], "conflicts": [{"between": ["<id>", "<id>"], ' &
+                     '"kind": "time|order|person|dependency|goal", "why": "<the exact clash, max 25 words>"}], "questions": [""]}' %}
+        inferenceConfig:
+          maxTokens: 700
+          temperature: 0.2
+    Retry:
+      - ErrorEquals: [Bedrock.ThrottlingException, Bedrock.ServiceUnavailableException, Bedrock.ModelTimeoutException, Bedrock.InternalServerException]
+        IntervalSeconds: 2
+        BackoffRate: 2
+        MaxAttempts: 3
+        JitterStrategy: FULL
+    Assign:
+      o: >-
+        {% (
+          $b := $type($states.result.Body) = 'string' ? $parse($states.result.Body) : $states.result.Body;
+          $parse($match($b.output.message.content[0].text, /\{[\s\S]*\}/)[0].match)
+        ) %}
+      tokens: >-
+        {% (
+          $b := $type($states.result.Body) = 'string' ? $parse($states.result.Body) : $states.result.Body;
+          { 'in': $b.usage.inputTokens, 'out': $b.usage.outputTokens }
+        ) %}
+    Next: Build
+
+  Build:
+    Type: Pass
+    Comment: >-
+      Code builds the ledger. A numeric update (old and new words checked) is applied to its plan line only if the exact
+      words can be replaced; otherwise both stay and the clash is listed as a conflict for the planner to resolve.
+    Assign:
+      ledger: >-
+        {% (
+          $ids := $items.id;
+          $txt := function($id){ $filter($items, function($x){ $x.id = $uppercase($trim($id)) })[0].text };
+          $cap := function($v){ $uppercase($substring($v, 0, 1)) & $substring($v, 1) };
+          $num := /\b([0-9]+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|twenty|thirty|forty|fifty|hundred)\b/i;
+          $ord := $append([], $distinct($append([], $filter($append([], $o.order), function($v){ $type($v) = 'string' }).$uppercase($trim($)))));
+          $ord := $append([], $filter($ord, function($v){ $v in $ids and $substring($v, 0, 1) = 'C' }));
+          $cids := $append($ord, $append([], $filter($ids, function($v){ $substring($v, 0, 1) = 'C' and $not($v in $ord) })));
+          $upd := $append([], $filter($append([], $o.updates), function($u){
+            $type($u) = 'object' and $type($u.p) = 'string' and $type($u.c) = 'string' and $type($u.old) = 'string' and $type($u.new) = 'string'
+            and $substring($uppercase($trim($u.p)), 0, 1) = 'P' and $substring($uppercase($trim($u.c)), 0, 1) = 'C'
+            and $exists($txt($u.p)) and $exists($txt($u.c))
+            and $contains($lowercase($txt($u.p)), $lowercase($trim($u.old)))
+            and $count($filter($split($lowercase($trim($u.new)), ' '), function($w){ $length($w) > 0 and $not($contains($lowercase($txt($u.c)), $w)) })) = 0
+            and $contains($u.old, $num) and $contains($u.new, $num) and $lowercase($trim($u.old)) != $lowercase($trim($u.new)) }));
+          $lines := $append([], $map($filter($items, function($x){ $substring($x.id, 0, 1) = 'P' }), function($p){ (
+            $u := $filter($upd, function($x){ $uppercase($trim($x.p)) = $p.id })[0];
+            $r1 := $u ? $replace($p.text, $trim($u.old), $trim($u.new)) : $p.text;
+            $r := ($u and $r1 = $p.text) ? $replace($p.text, $cap($trim($u.old)), $cap($trim($u.new))) : $r1;
+            $u
+              ? ($r != $p.text
+                  ? { 'id': $p.id, 'text': $cap($r), 'original': $p.text, 'change_id': $uppercase($trim($u.c)), 'status': 'replaced' }
+                  : { 'id': $p.id, 'text': $p.text, 'change_id': $uppercase($trim($u.c)), 'status': 'unresolved' })
+              : { 'id': $p.id, 'text': $p.text, 'status': 'original' }
+          ) }));
+          $acc := $append([], $map($cids, function($id){ { 'id': $id, 'action': $txt($id), 'status': 'proposed' } }));
+          $qs := $append([], $map($filter($items, function($x){ $substring($x.id, 0, 1) = 'K' }), function($k, $i){ { 'id': 'Q' & ($i + 1), 'question': $k.text } }));
+          $rps := $append([], $map($reports, function($v, $i){ { 'id': 'R' & ($i + 1), 'text': $v, 'status': 'unverified' } }));
+          $maybe := $append([], $filter($append([], $o.updates), function($u){
+            $type($u) = 'object' and $type($u.p) = 'string' and $type($u.c) = 'string'
+            and $substring($uppercase($trim($u.p)), 0, 1) = 'P' and $substring($uppercase($trim($u.c)), 0, 1) = 'C'
+            and $exists($txt($u.p)) and $exists($txt($u.c))
+            and $not($uppercase($trim($u.p)) in $upd.($uppercase($trim(p)))) }));
+          $warn := $append([], $maybe.{ 'between': [$substring($txt(p), 0, 80), $substring($txt(c), 0, 80)], 'kind': 'update',
+                       'why': 'This change may alter this line of your plan. The line was not rewritten; decide which one stands.' });
+          $cq := $append([], $filter($append([], $o.questions), function($q){ $type($q) = 'string' and $length($trim($q)) > 8 }).{
+                       'between': [], 'kind': 'question', 'why': $substring($trim($), 0, 200) });
+          $sup := $append([], $lines[status = 'replaced'].{ 'original': original, 'replacement': text, 'change_id': change_id, 'status': 'proposed' });
+          $unres := $append([], $lines[status = 'unresolved'].{ 'between': [$substring(text, 0, 80), $substring($txt(change_id), 0, 80)], 'kind': 'update',
+                       'why': 'This change alters this line of your plan, and the line could not be rewritten exactly. Decide which one stands.' });
+          $conf := $append([], $filter($append([], $o.conflicts), function($x){ $type($x) = 'object' and $type($x.why) = 'string' and $length($trim($x.why)) > 0
+              and $count($append([], $x.between)) = 2 and $x.kind in ['time', 'order', 'person', 'dependency', 'goal'] }).{
+            'between': $append([], $map($filter($append([], between), function($v){ $type($v) = 'string' }), function($v){ (
+                $m := $filter($items, function($x){ $x.id = $uppercase($trim($v)) });
+                $substring($exists($m) ? $m[0].text : $v, 0, 80) ) })), 'kind': kind, 'why': $substring($trim(why), 0, 200) });
+          $eff := $join($lines.text, ' ')
+            & ($count($acc) > 0 ? '\n\nProposed changes (accepted by the planner, planned, not done yet):\n- ' & $join($acc.action, '\n- ') : '')
+            & ($count($qs) > 0 ? '\n\nOpen questions (not answered yet; these are not safeguards):\n- ' & $join($qs.question, '\n- ') : '');
+          {
+            'revision_id': $revision_id, 'run_id': $run_id, 'revision_status': 'proposed',
+            'original_plan': $plan,
+            'plan_lines': $lines,
+            'accepted_changes': $acc,
+            'superseded_items': $sup,
+            'open_questions': $qs,
+            'planner_reports': $rps,
+            'conflicts': $append($append($append($unres, $warn), $conf), $cq),
+            'effective_plan_text': $eff,
+            'bullets': $append($lines.(status = 'replaced'
+                ? { 'text': text, 'changed': true, 'replaces': original }
+                : status = 'unresolved' ? { 'text': text, 'changed': false, 'updated_by': $txt(change_id) } : { 'text': text, 'changed': false }),
+              $acc.{ 'text': action, 'changed': true }),
+            'changes': $acc.action, 'checks': $qs.question,
+            'tokens': $tokens
+          }
+        ) %}
+    Next: Persist
+
+  Persist:
+    Type: Task
+    Resource: arn:aws:states:::dynamodb:putItem
+    Arguments:
+      TableName: ${TableName}
+      Item:
+        pk: { S: "{% 'run#' & $run_id %}" }
+        sk: { S: "{% 'REV#' & $revision_id %}" }
+        revision: { S: "{% $string($ledger) %}" }
+        created_at: { S: "{% $states.context.Execution.StartTime %}" }
+        ttl: { N: "{% $string($floor($toMillis($states.context.Execution.StartTime) / 1000) + 2592000) %}" }
+    Output: "{% $merge([$ledger, { 'persisted': true }]) %}"
+    Catch:
+      - ErrorEquals: [States.ALL]
+        Output: "{% $merge([$ledger, { 'persisted': false }]) %}"
+        Next: Done
+    Next: Done
+
+  Done:
+    Type: Succeed

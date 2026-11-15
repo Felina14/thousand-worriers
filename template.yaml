@@ -1,0 +1,641 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  1,000 Worriers - serverless pre-mortem swarm on Amazon Nova.
+  REST API -> Step Functions (Nova Lite grid, Distributed Map of Nova Micro worriers) -> Tally Lambda -> DynamoDB.
+
+Parameters:
+  TableName:
+    Type: String
+    Default: worriers
+    Description: DynamoDB table name (a dev stack overrides it so both stacks can live in one account).
+  AlertEmail:
+    Type: String
+    Description: Email that receives the $5 AWS Budgets alert.
+  BudgetLimitUsd:
+    Type: Number
+    Default: 5
+  LiteModelId:
+    Type: String
+    Default: amazon.nova-lite-v1:0
+    AllowedValues: [amazon.nova-lite-v1:0]
+  ProModelId:
+    Type: String
+    Default: amazon.nova-pro-v1:0
+    AllowedValues: [amazon.nova-pro-v1:0]
+    Description: Nova Pro writes the five fix cards only.
+  DailyRunQuota:
+    Type: Number
+    Default: 100
+    Description: Max POST /runs per day across everyone (usage plan).
+  MicroProfileId:
+    Type: String
+    Default: us.amazon.nova-micro-v1:0
+    AllowedValues: [us.amazon.nova-micro-v1:0]
+
+Resources:
+  # ---------- Data ----------
+  WorriersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Ref TableName
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: pk, AttributeType: S }
+        - { AttributeName: sk, AttributeType: S }
+      KeySchema:
+        - { AttributeName: pk, KeyType: HASH }
+        - { AttributeName: sk, KeyType: RANGE }
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  # One bucket: site/ is served by CloudFront, results/ holds Distributed Map output.
+  AppBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-swarm-results
+            Status: Enabled
+            Prefix: results/
+            ExpirationInDays: 30
+
+  AppBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AppBucket
+      PolicyDocument:
+        Statement:
+          - Sid: CloudFrontOACReadSite
+            Effect: Allow
+            Principal: { Service: cloudfront.amazonaws.com }
+            Action: s3:GetObject
+            Resource: !Sub "${AppBucket.Arn}/site/*"
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${Cdn}"
+
+  # ---------- Edge ----------
+  CdnOac:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${AWS::StackName}-oac"
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  Cdn:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: 1,000 Worriers
+        DefaultRootObject: index.html
+        HttpVersion: http2and3
+        PriceClass: PriceClass_100
+        Origins:
+          - Id: site
+            DomainName: !GetAtt AppBucket.RegionalDomainName
+            OriginPath: /site
+            S3OriginConfig: { OriginAccessIdentity: "" }
+            OriginAccessControlId: !GetAtt CdnOac.Id
+          - Id: api
+            DomainName: !Sub "${Api}.execute-api.${AWS::Region}.amazonaws.com"
+            OriginPath: /prod
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols: [TLSv1.2]
+          - Id: api-start
+            DomainName: !Sub "${Api}.execute-api.${AWS::Region}.amazonaws.com"
+            OriginPath: /prod
+            # Only CloudFront knows the API key, and only on the exact path /runs (start a run),
+            # so the daily quota counts run starts, never polling. The raw execute-api URL cannot start runs.
+            OriginCustomHeaders:
+              - HeaderName: x-api-key
+                HeaderValue: !Select [2, !Split ["/", !Ref "AWS::StackId"]]
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols: [TLSv1.2]
+        DefaultCacheBehavior:
+          TargetOriginId: site
+          ViewerProtocolPolicy: redirect-to-https
+          Compress: true
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6 # Managed-CachingOptimized
+        CacheBehaviors:
+          # Same-origin API: the browser calls /runs... on the CloudFront domain, no CORS needed.
+          - PathPattern: /runs
+            TargetOriginId: api-start
+            ViewerProtocolPolicy: https-only
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad # Managed-CachingDisabled
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac # Managed-AllViewerExceptHostHeader
+          - PathPattern: /runs/*
+            TargetOriginId: api
+            ViewerProtocolPolicy: https-only
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad # Managed-CachingDisabled
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac # Managed-AllViewerExceptHostHeader
+
+  # ---------- API (direct service integrations, no Lambda) ----------
+  ApiRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: { Service: apigateway.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: read-worriers
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:Query]
+                Resource: !GetAtt WorriersTable.Arn
+        - PolicyName: start-worry-run
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action: states:StartExecution
+                Resource: !Ref WorryRun
+              - Effect: Allow
+                Action: states:StartSyncExecution
+                Resource: [!Ref Reminders, !Ref Revise]
+
+  # ---------- Worry run (Standard, JSONata) ----------
+  WorryRunRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: { Service: states.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: worry-run
+          PolicyDocument:
+            Statement:
+              - Sid: NovaOnly
+                Effect: Allow
+                Action: bedrock:InvokeModel
+                Resource:
+                  - !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/${LiteModelId}"
+                  - !Sub "arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/${MicroProfileId}"
+                  - "arn:aws:bedrock:*::foundation-model/amazon.nova-micro-v1:0"
+              - Effect: Allow
+                Action: [dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:GetItem, dynamodb:BatchWriteItem]
+                Resource: !GetAtt WorriersTable.Arn
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: [!GetAtt TallyFunction.Arn, !Sub "${TallyFunction.Arn}:*"]
+              - Sid: DistributedMapChildren
+                Effect: Allow
+                Action: [states:StartExecution, states:DescribeExecution, states:StopExecution]
+                Resource:
+                  - !Sub "arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${AWS::StackName}-worry-run"
+                  - !Sub "arn:aws:states:${AWS::Region}:${AWS::AccountId}:execution:${AWS::StackName}-worry-run/*"
+                  - !Sub "arn:aws:states:${AWS::Region}:${AWS::AccountId}:execution:${AWS::StackName}-worry-run:*"
+              - Sid: ResultWriter
+                Effect: Allow
+                Action: [s3:PutObject, s3:GetObject, s3:ListMultipartUploadParts, s3:AbortMultipartUpload]
+                Resource: !Sub "${AppBucket.Arn}/results/*"
+
+  WorryRun:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: !Sub "${AWS::StackName}-worry-run"
+      Type: STANDARD
+      Role: !GetAtt WorryRunRole.Arn
+      DefinitionUri: statemachine/worry-run.asl.yaml
+      DefinitionSubstitutions:
+        TableName: !Ref WorriersTable
+        BucketName: !Ref AppBucket
+        LiteModel: !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/${LiteModelId}"
+        MicroModel: !Sub "arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/${MicroProfileId}"
+        TallyFunctionArn: !GetAtt TallyFunction.Arn
+
+  TallyFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/tally/
+      Handler: app.handler
+      Runtime: python3.13
+      Architectures: [arm64]
+      MemorySize: 1024
+      Timeout: 600
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref WorriersTable
+          LITE_MODEL: !Ref LiteModelId
+          PRO_MODEL: !Ref ProModelId
+          BUCKET_NAME: !Ref AppBucket
+          TALLY_V2: "1"   # v2 (worrycore) is the default; any v2 failure falls back to v1 and marks the run; per-run override {"tally": "v1"}
+      Policies:
+        - DynamoDBReadPolicy: { TableName: !Ref WorriersTable }
+        - Statement:
+            - Sid: V2State
+              Effect: Allow
+              Action: [s3:GetObject, s3:PutObject]
+              Resource: !Sub "${AppBucket.Arn}/results/*"
+        - Statement:
+            - Sid: NovaOnly
+              Effect: Allow
+              Action: bedrock:InvokeModel
+              Resource:
+                - !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/${LiteModelId}"
+                - !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/${ProModelId}"
+
+  TallyLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${TallyFunction}"
+      RetentionInDays: 14
+
+  Api:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: prod
+      EndpointConfiguration: { Type: REGIONAL }
+      MethodSettings:
+        - ResourcePath: "/*"
+          HttpMethod: "*"
+          ThrottlingRateLimit: 20
+          ThrottlingBurstLimit: 40
+        - ResourcePath: "/~1runs~1{id}~1reminders"
+          HttpMethod: POST
+          ThrottlingRateLimit: 1
+          ThrottlingBurstLimit: 2
+        - ResourcePath: "/~1runs"
+          HttpMethod: POST
+          ThrottlingRateLimit: 1
+          ThrottlingBurstLimit: 2
+        - ResourcePath: "/~1runs~1{id}~1revise"
+          HttpMethod: POST
+          ThrottlingRateLimit: 1
+          ThrottlingBurstLimit: 2
+      DefinitionBody:
+        openapi: "3.0.1"
+        info: { title: thousand-worriers, version: "1" }
+        x-amazon-apigateway-api-key-source: HEADER
+        components:
+          securitySchemes:
+            api_key: { type: apiKey, name: x-api-key, in: header }
+        paths:
+          /runs:
+            post:
+              security:
+                - api_key: []
+              responses:
+                "202": { description: run started }
+              x-amazon-apigateway-integration:
+                type: aws
+                httpMethod: POST
+                uri: !Sub "arn:aws:apigateway:${AWS::Region}:states:action/StartExecution"
+                credentials: !GetAtt ApiRole.Arn
+                passthroughBehavior: never
+                requestTemplates:
+                  application/json: !Sub |
+                    {
+                      "stateMachineArn": "${WorryRun}",
+                      "name": "$context.requestId",
+                      "input": "$util.escapeJavaScript($input.json('$')).replaceAll("\\'", "'")"
+                    }
+                responses:
+                  "4\\d{2}":
+                    statusCode: "400"
+                    responseTemplates:
+                      application/json: '{"error":"could not start run"}'
+                  default:
+                    statusCode: "202"
+                    responseTemplates:
+                      application/json: '{"run_id":"$context.requestId"}'
+          /runs/{id}:
+            get:
+              parameters:
+                - { name: id, in: path, required: true, schema: { type: string } }
+              responses:
+                "200": { description: run }
+                "404": { description: not found }
+              x-amazon-apigateway-integration:
+                type: aws
+                httpMethod: POST
+                uri: !Sub "arn:aws:apigateway:${AWS::Region}:dynamodb:action/GetItem"
+                credentials: !GetAtt ApiRole.Arn
+                passthroughBehavior: never
+                requestTemplates:
+                  application/json: !Sub |
+                    {
+                      "TableName": "${WorriersTable}",
+                      "Key": {
+                        "pk": {"S": "run#$util.escapeJavaScript($input.params('id'))"},
+                        "sk": {"S": "META"}
+                      },
+                      "ConsistentRead": true
+                    }
+                responses:
+                  default:
+                    statusCode: "200"
+                    responseTemplates:
+                      application/json: |
+                        #set($i = $input.path('$.Item'))
+                        #set($pk = "$!i.pk.S")
+                        #if($pk == "")
+                        #set($context.responseOverride.status = 404)
+                        {"error":"run not found"}
+                        #else
+                        #set($n = "$!i.n.N")#set($done = "$!i.done.N")#set($failed = "$!i.failed.N")
+                        #set($parent = "$!i.parent_run_id.S")#set($result = "$!i.result.S")
+                        #set($grid = "$!i.grid.S")#set($labels = "$!i.labels.S")
+                        {
+                          "run_id": "$util.escapeJavaScript($input.params('id'))",
+                          "status": "$util.escapeJavaScript("$!i.status.S").replaceAll("\\'", "'")",
+                          "n": #if($n == "")0#{else}$n#end,
+                          "done": #if($done == "")0#{else}$done#end,
+                          "failed": #if($failed == "")0#{else}$failed#end,
+                          "parent_run_id": #if($parent == "")null#{else}"$util.escapeJavaScript($parent).replaceAll("\\'", "'")"#end,
+                          "created_at": "$util.escapeJavaScript("$!i.created_at.S").replaceAll("\\'", "'")",
+                          "plan": "$util.escapeJavaScript("$!i.plan.S").replaceAll("\\'", "'")",
+                          #set($calls = "$!i.micro_calls.N")
+                          "calls": #if($calls == "")0#{else}$calls#end,
+                          "finished_at": "$util.escapeJavaScript("$!i.finished_at.S").replaceAll("\\'", "'")",
+                          "result": #if($result == "")null#{else}$result#end,
+                          "grid": #if($grid == "")null#{else}$grid#end,
+                          "labels": #if($labels == "")null#{else}$labels#end
+                        }
+                        #end
+          /runs/{id}/reminders:
+            post:
+              parameters:
+                - { name: id, in: path, required: true, schema: { type: string } }
+              responses:
+                "200": { description: reminders scheduled }
+                "400": { description: bad request }
+              x-amazon-apigateway-integration:
+                type: aws
+                httpMethod: POST
+                uri: !Sub "arn:aws:apigateway:${AWS::Region}:states:action/StartSyncExecution"
+                credentials: !GetAtt ApiRole.Arn
+                passthroughBehavior: never
+                requestTemplates:
+                  application/json: !Sub |
+                    {
+                      "stateMachineArn": "${Reminders}",
+                      "name": "$util.escapeJavaScript($input.params('id'))-$context.requestId",
+                      "input": "$util.escapeJavaScript($input.json('$')).replaceAll("\\'", "'")"
+                    }
+                responses:
+                  default:
+                    statusCode: "200"
+                    responseTemplates:
+                      application/json: |
+                        #set($r = $input.path('$'))
+                        #if($r.status == "SUCCEEDED")
+                        $r.output
+                        #else
+                        #set($context.responseOverride.status = 400)
+                        {"error": "$util.escapeJavaScript("$!r.error").replaceAll("\\'", "'")", "cause": "$util.escapeJavaScript("$!r.cause").replaceAll("\\'", "'")"}
+                        #end
+          /runs/{id}/revise:
+            post:
+              parameters:
+                - { name: id, in: path, required: true, schema: { type: string } }
+              responses:
+                "200": { description: revised plan }
+                "400": { description: bad request }
+              x-amazon-apigateway-integration:
+                type: aws
+                httpMethod: POST
+                uri: !Sub "arn:aws:apigateway:${AWS::Region}:states:action/StartSyncExecution"
+                credentials: !GetAtt ApiRole.Arn
+                passthroughBehavior: never
+                requestTemplates:
+                  application/json: !Sub |
+                    {
+                      "stateMachineArn": "${Revise}",
+                      "name": "$util.escapeJavaScript($input.params('id'))-$context.requestId",
+                      "input": "$util.escapeJavaScript($input.json('$')).replaceAll("\\'", "'")"
+                    }
+                responses:
+                  default:
+                    statusCode: "200"
+                    responseTemplates:
+                      application/json: |
+                        #set($r = $input.path('$'))
+                        #if($r.status == "SUCCEEDED")
+                        $r.output
+                        #else
+                        #set($context.responseOverride.status = 400)
+                        {"error": "$util.escapeJavaScript("$!r.error").replaceAll("\\'", "'")", "cause": "$util.escapeJavaScript("$!r.cause").replaceAll("\\'", "'")"}
+                        #end
+          /runs/{id}/worries:
+            get:
+              parameters:
+                - { name: id, in: path, required: true, schema: { type: string } }
+              responses:
+                "200": { description: newest worries }
+              x-amazon-apigateway-integration:
+                type: aws
+                httpMethod: POST
+                uri: !Sub "arn:aws:apigateway:${AWS::Region}:dynamodb:action/Query"
+                credentials: !GetAtt ApiRole.Arn
+                passthroughBehavior: never
+                requestTemplates:
+                  application/json: !Sub |
+                    {
+                      "TableName": "${WorriersTable}",
+                      "KeyConditionExpression": "pk = :pk AND begins_with(sk, :w)",
+                      "ExpressionAttributeValues": {
+                        ":pk": {"S": "run#$util.escapeJavaScript($input.params('id'))"},
+                        ":w": {"S": "W#"}
+                      },
+                      "ScanIndexForward": false,
+                      #set($lim = "$!input.params('limit')")
+                      "Limit": #if($lim.matches("^([1-9][0-9]{0,2}|1000)$"))$lim#{else}30#end
+                    }
+                responses:
+                  default:
+                    statusCode: "200"
+                    responseTemplates:
+                      application/json: |
+                        #set($items = $input.path('$.Items'))
+                        {"worries": [
+                        #foreach($w in $items)
+                          {
+                            "seq": "$util.escapeJavaScript($w.sk.S).replaceAll("\\'", "'")",
+                            "character": "$util.escapeJavaScript($w.character.S).replaceAll("\\'", "'")",
+                            "group": "$util.escapeJavaScript("$!w.group.S").replaceAll("\\'", "'")",
+                            "angle": "$util.escapeJavaScript($w.angle.S).replaceAll("\\'", "'")",
+                            "moment": "$util.escapeJavaScript($w.moment.S).replaceAll("\\'", "'")",
+                            "failure": "$util.escapeJavaScript($w.failure.S).replaceAll("\\'", "'")",
+                            #set($sev = "$!w.severity.N")
+                            "severity": #if($sev == "")null#{else}$sev#end,
+                            "early_sign": "$util.escapeJavaScript($w.early_sign.S).replaceAll("\\'", "'")"
+                          }#if($foreach.hasNext),#end
+                        #end
+                        ]}
+
+  # ---------- Reminders: Express SM -> EventBridge Scheduler (one-time at()) -> SES SendEmail ----------
+  SchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: { Service: scheduler.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition: { StringEquals: { "aws:SourceAccount": !Ref "AWS::AccountId" } }
+      Policies:
+        - PolicyName: send-reminder-email
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action: ses:SendEmail
+                Resource: !Sub "arn:aws:ses:${AWS::Region}:${AWS::AccountId}:identity/*"
+
+  RemindersRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: { Service: states.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: create-reminder-schedules
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action: scheduler:CreateSchedule
+                Resource: !Sub "arn:aws:scheduler:${AWS::Region}:${AWS::AccountId}:schedule/default/tw-*"
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt SchedulerRole.Arn
+
+  Reminders:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: !Sub "${AWS::StackName}-reminders"
+      Type: EXPRESS
+      Role: !GetAtt RemindersRole.Arn
+      DefinitionUri: statemachine/reminders.asl.yaml
+      DefinitionSubstitutions:
+        SchedulerRoleArn: !GetAtt SchedulerRole.Arn
+        SenderEmail: !Ref AlertEmail
+
+  # ---------- Revised plan (Express, one Nova Pro call, no Lambda) ----------
+  ReviseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: { Service: states.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: revise-plan
+          PolicyDocument:
+            Statement:
+              - Sid: NovaProOnly
+                Effect: Allow
+                Action: bedrock:InvokeModel
+                Resource: !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/${ProModelId}"
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem]
+                Resource: !GetAtt WorriersTable.Arn
+
+  Revise:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: !Sub "${AWS::StackName}-revise"
+      Type: EXPRESS
+      Role: !GetAtt ReviseRole.Arn
+      DefinitionUri: statemachine/revise.asl.yaml
+      DefinitionSubstitutions:
+        TableName: !Ref WorriersTable
+        ProModelId: !Ref ProModelId
+
+  # ---------- Abuse guard: ~100 runs per day in total ----------
+  RunsKey:
+    Type: AWS::ApiGateway::ApiKey
+    DependsOn: ApiprodStage
+    Properties:
+      Name: !Sub "${AWS::StackName}-cloudfront"
+      Enabled: true
+      Value: !Select [2, !Split ["/", !Ref "AWS::StackId"]]
+
+  RunsUsagePlan:
+    Type: AWS::ApiGateway::UsagePlan
+    DependsOn: ApiprodStage
+    Properties:
+      UsagePlanName: !Sub "${AWS::StackName}-runs"
+      Description: Caps POST /runs (the only call that spends Bedrock money).
+      ApiStages:
+        - ApiId: !Ref Api
+          Stage: prod
+      Quota: { Limit: !Ref DailyRunQuota, Period: DAY }
+      Throttle: { RateLimit: 1, BurstLimit: 2 }
+
+  RunsUsagePlanKey:
+    Type: AWS::ApiGateway::UsagePlanKey
+    Properties:
+      KeyId: !Ref RunsKey
+      KeyType: API_KEY
+      UsagePlanId: !Ref RunsUsagePlan
+
+  # ---------- Cost guard ----------
+  MonthlyBudget:
+    Type: AWS::Budgets::Budget
+    Properties:
+      Budget:
+        BudgetName: !Sub "${AWS::StackName}-monthly"
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        BudgetLimit: { Amount: !Ref BudgetLimitUsd, Unit: USD }
+      NotificationsWithSubscribers:
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: 100
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - { SubscriptionType: EMAIL, Address: !Ref AlertEmail }
+        - Notification:
+            NotificationType: FORECASTED
+            ComparisonOperator: GREATER_THAN
+            Threshold: 100
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - { SubscriptionType: EMAIL, Address: !Ref AlertEmail }
+
+Outputs:
+  SiteUrl:
+    Description: Public app URL (CloudFront). API is same-origin under /runs.
+    Value: !Sub "https://${Cdn.DomainName}"
+  DistributionId:
+    Value: !Ref Cdn
+  ApiUrl:
+    Description: Direct REST API base URL
+    Value: !Sub "https://${Api}.execute-api.${AWS::Region}.amazonaws.com/prod"
+  TableName:
+    Value: !Ref WorriersTable
+  BucketName:
+    Description: site/ is served by CloudFront; results/ holds swarm output
+    Value: !Ref AppBucket
+  BudgetName:
+    Value: !Ref MonthlyBudget
+  WorryRunArn:
+    Value: !Ref WorryRun
+  TallyFunctionName:
+    Value: !Ref TallyFunction
+  RemindersArn:
+    Value: !Ref Reminders
