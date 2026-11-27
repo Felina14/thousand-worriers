@@ -3,9 +3,10 @@ Comment: >-
   5 worriers per request) -> tally (Lambda) -> save. One swarm and one tally at a time account-wide (lease locks, F05/F04).
 QueryLanguage: JSONata
 StartAt: Init
-# Hard stop so a run can never hang (F05). Worst case: 1,200 s swarm queue + ~900 s swarm + 2,400 s tally queue
-# + 3 x 600 s tally attempts with their retry waits.
-TimeoutSeconds: 7200
+# Hard stop so a run can never hang (F05). tests/test_worry_run_budget.py adds up the worst case from this file
+# (3 Grid attempts, 1,200 s swarm queue, swarm <= its 900 s lease, 1,500 s tally queue, 3 Tally attempts of 600 s
+# with their retry waits, every other state with its retries) and requires it to stay under 90% of this value.
+TimeoutSeconds: 9000
 States:
 
   Init:
@@ -198,6 +199,8 @@ States:
         inferenceConfig:
           maxTokens: 1500
           temperature: 0.7
+    # Bounds each Nova Lite call (a 1,500-token grid takes ~15 s), so the run's worst case is finite.
+    TimeoutSeconds: 60
     Retry:
       - ErrorEquals: [Bedrock.ThrottlingException, Bedrock.ServiceUnavailableException, Bedrock.ModelTimeoutException, Bedrock.InternalServerException]
         IntervalSeconds: 2
@@ -842,12 +845,13 @@ States:
     Next: RequestTallyLock
 
   # Lease: 3 Tally attempts of up to 600 s each plus the retry waits stay under 2,100 s.
+  # Queue limit 1,500 s (25 min): with 4 runs per wave the last tally waits for ~3 tallies of ~200 s.
   RequestTallyLock:
     Type: Pass
     Assign:
       lock_name: tally
       lease_s: 2100
-      max_wait_s: 2400
+      max_wait_s: 1500
       queued_at: "{% $toMillis($states.context.State.EnteredTime) %}"
       lock_path: free
     Next: AcquireLock
