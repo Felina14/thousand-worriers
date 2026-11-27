@@ -1,10 +1,11 @@
 Comment: >-
   1,000 Worriers - one run. Grid (Nova Lite) -> items -> swarm (Nova Micro, Distributed Map,
-  5 worriers per request) -> tally (Lambda) -> save. One swarm at a time account-wide (F05 lease lock).
+  5 worriers per request) -> tally (Lambda) -> save. One swarm and one tally at a time account-wide (lease locks, F05/F04).
 QueryLanguage: JSONata
 StartAt: Init
-# Hard stop so a run can never hang (F05). Typical worst case: 1,200 s queue + ~900 s swarm + 600 s tally.
-TimeoutSeconds: 3600
+# Hard stop so a run can never hang (F05). Worst case: 1,200 s swarm queue + ~900 s swarm + 2,400 s tally queue
+# + 3 x 600 s tally attempts with their retry waits.
+TimeoutSeconds: 7200
 States:
 
   Init:
@@ -28,6 +29,12 @@ States:
       # F05: how long a run may queue for the swarm lock before it ends BUSY (20-1,200 s, default 1,200).
       lock_max_wait_s: "{% $exists($states.input.lock_max_wait_s) ? $min([$max([20, $floor($number($string($states.input.lock_max_wait_s)))]), 1200]) : 1200 %}"
       lock_path: free
+      lock_name: swarm
+      lease_s: 900
+      max_wait_s: 1200
+      queued_at: 0
+      lease_expired: false
+      holder_status: ""
     Next: IsRetest
 
   IsRetest:
@@ -306,7 +313,11 @@ States:
         ":li": { N: "{% $string($lite_in) %}" }
         ":lo": { N: "{% $string($lite_out) %}" }
     Assign:
+      lock_name: swarm
+      lease_s: 900
+      max_wait_s: "{% $lock_max_wait_s %}"
       queued_at: "{% $toMillis($states.context.State.EnteredTime) %}"
+      lock_path: free
     Output: {}
     Catch:
       - ErrorEquals: [States.ALL]
@@ -314,30 +325,32 @@ States:
         Next: ReleaseOnFail
     Next: AcquireLock
 
-  # ---- F05 (REL04-BP02, REL05-BP04) / F04 (REL01-BP04): global admission control on the Nova Micro fan-out ----
-  # One swarm at a time across all runs. MaxConcurrency 6 below is sized for ONE run under the 200 RPM
-  # Nova Micro quota; before this lock, N concurrent runs put 6N requests in flight against that one quota.
-  # The lock is a lease: holder = execution ARN, expiresAt = acquire time + 900 s (a lone swarm takes ~2 min).
-  # Every exit the run can catch releases it (ReleaseLock after Swarm, ReleaseOnFail on every Catch).
-  # Exits it cannot catch (StopExecution, the 3,600 s execution timeout) are covered by the waiters:
-  # they take the lease over when it expired or when the holder execution is no longer RUNNING.
-  # (A Distributed Map has no TimeoutSeconds; a swarm that outruns its lease just loses the lock.)
+  # ---- Admission control (F05 REL04-BP02, REL05-BP04; F04 REL01-BP04): two account-wide leases ----
+  # lock#swarm: one swarm at a time. MaxConcurrency 6 is sized for ONE run under the 200 RPM Nova Micro quota.
+  # lock#tally: one tally at a time. Tally sends its Nova Pro calls one at a time at <= 12 RPM (functions/tally/app.py),
+  #   so one tally at a time keeps the account under the 13 RPM Nova Pro quota.
+  # The two are separate leases because Micro and Pro quotas are separate: run 2 can swarm while run 1 tallies.
+  # The same states serve both; $lock_name, $lease_s and $max_wait_s say which lease is being taken.
+  # A lease item holds the holder's execution ARN and expiresAt. Every exit the run can catch releases it
+  # (ReleaseLock, ReleaseTallyLock, ReleaseOnFail). Exits it cannot catch (StopExecution, the execution timeout)
+  # are covered by the waiters: they check the holder and take the lease over when the holder is no longer
+  # RUNNING or the lease has expired. lock_path records which: free / takeover from <status> / expired, holder <status>.
   AcquireLock:
     Type: Task
     Resource: arn:aws:states:::dynamodb:putItem
     Arguments:
       TableName: ${TableName}
       Item:
-        pk: { S: "lock#swarm" }
+        pk: { S: "{% 'lock#' & $lock_name %}" }
         sk: { S: LEASE }
         holder: { S: "{% $states.context.Execution.Id %}" }
         run_id: { S: "{% $run_id %}" }
         acquiredAt: { S: "{% $states.context.State.EnteredTime %}" }
-        expiresAt: { N: "{% $string($floor($toMillis($states.context.State.EnteredTime) / 1000) + 900) %}" }
+        expiresAt: { N: "{% $string($floor($toMillis($states.context.State.EnteredTime) / 1000) + $lease_s) %}" }
         ttl: { N: "{% $string($floor($toMillis($states.context.State.EnteredTime) / 1000) + 86400) %}" }
-      ConditionExpression: "attribute_not_exists(pk) OR expiresAt < :now OR holder = :me"
+      # Only a free lease (or our own). Expired leases go through CheckHolder/TakeOver, so lock_path says so.
+      ConditionExpression: "attribute_not_exists(pk) OR holder = :me"
       ExpressionAttributeValues:
-        ":now": { N: "{% $string($floor($toMillis($states.context.State.EnteredTime) / 1000)) %}" }
         ":me": { S: "{% $states.context.Execution.Id %}" }
     Retry:
       - ErrorEquals: [DynamoDB.ProvisionedThroughputExceededException, DynamoDB.ThrottlingException, DynamoDB.InternalServerErrorException]
@@ -351,7 +364,7 @@ States:
       - ErrorEquals: [States.ALL]
         Assign: { err: "{% $states.errorOutput %}" }
         Next: ReleaseOnFail
-    Next: MarkSwarm
+    Next: LockAcquired
 
   ReadLock:
     Type: Task
@@ -359,11 +372,14 @@ States:
     Arguments:
       TableName: ${TableName}
       Key:
-        pk: { S: "lock#swarm" }
+        pk: { S: "{% 'lock#' & $lock_name %}" }
         sk: { S: LEASE }
       ConsistentRead: true
     Assign:
       lock: "{% $exists($states.result.Item) ? $states.result.Item : null %}"
+      lease_expired: >-
+        {% $exists($states.result.Item) and
+           $number($states.result.Item.expiresAt.N) < $floor($toMillis($states.context.State.EnteredTime) / 1000) %}
     Output: {}
     Catch:
       - ErrorEquals: [States.ALL]
@@ -375,12 +391,9 @@ States:
     Choices:
       - Condition: "{% $type($lock) != 'object' %}"
         Next: AcquireLock
-      - Condition: "{% $number($lock.expiresAt.N) < $floor($toMillis($states.context.State.EnteredTime) / 1000) %}"
-        Assign: { lock_path: expired }
-        Next: AcquireLock
     Default: CheckHolder
 
-  # Liveness of the holder: a killed, timed-out or failed execution cannot release, so a waiter takes over.
+  # Liveness of the holder, checked for expired leases too, so a takeover from a RUNNING holder is recorded.
   CheckHolder:
     Type: Task
     Resource: arn:aws:states:::aws-sdk:sfn:describeExecution
@@ -394,13 +407,14 @@ States:
         Assign: { holder_status: GONE }
         Next: HolderAlive
       - ErrorEquals: [States.ALL]
-        Next: QueueCheck
+        Assign: { holder_status: UNKNOWN }
+        Next: HolderAlive
     Next: HolderAlive
 
   HolderAlive:
     Type: Choice
     Choices:
-      - Condition: "{% $holder_status = 'RUNNING' %}"
+      - Condition: "{% ($holder_status = 'RUNNING' or $holder_status = 'UNKNOWN') and $lease_expired = false %}"
         Next: QueueCheck
     Default: TakeOver
 
@@ -410,19 +424,21 @@ States:
     Arguments:
       TableName: ${TableName}
       Item:
-        pk: { S: "lock#swarm" }
+        pk: { S: "{% 'lock#' & $lock_name %}" }
         sk: { S: LEASE }
         holder: { S: "{% $states.context.Execution.Id %}" }
         run_id: { S: "{% $run_id %}" }
         acquiredAt: { S: "{% $states.context.State.EnteredTime %}" }
-        expiresAt: { N: "{% $string($floor($toMillis($states.context.State.EnteredTime) / 1000) + 900) %}" }
+        expiresAt: { N: "{% $string($floor($toMillis($states.context.State.EnteredTime) / 1000) + $lease_s) %}" }
         ttl: { N: "{% $string($floor($toMillis($states.context.State.EnteredTime) / 1000) + 86400) %}" }
         took_over_from: { S: "{% $lock.holder.S & ' (' & $holder_status & ')' %}" }
-      ConditionExpression: "holder = :old"
+      # Exactly the lease we inspected: if another waiter replaced it first, we lose and look again.
+      ConditionExpression: "holder = :old AND expiresAt = :oldexp"
       ExpressionAttributeValues:
         ":old": { S: "{% $lock.holder.S %}" }
+        ":oldexp": { N: "{% $lock.expiresAt.N %}" }
     Assign:
-      lock_path: "{% 'takeover from ' & $holder_status %}"
+      lock_path: "{% ($lease_expired ? 'expired, holder ' : 'takeover from ') & $holder_status %}"
     Output: {}
     Catch:
       - ErrorEquals: [DynamoDB.ConditionalCheckFailedException]
@@ -430,13 +446,25 @@ States:
       - ErrorEquals: [States.ALL]
         Assign: { err: "{% $states.errorOutput %}" }
         Next: ReleaseOnFail
-    Next: MarkSwarm
+    Next: LockAcquired
+
+  LockAcquired:
+    Type: Choice
+    Choices:
+      - Condition: "{% $lock_name = 'tally' %}"
+        Next: MarkTallyLock
+    Default: MarkSwarm
 
   QueueCheck:
     Type: Choice
     Choices:
-      - Condition: "{% $toMillis($states.context.State.EnteredTime) - $queued_at >= $lock_max_wait_s * 1000 %}"
+      - Condition: "{% $toMillis($states.context.State.EnteredTime) - $queued_at >= $max_wait_s * 1000 and $lock_name = 'swarm' %}"
         Next: MarkBusy
+      # A finished swarm is never thrown away: past the tally queue limit, Tally runs without the lease
+      # (its Pro calls still go one at a time with backoff) and META says so.
+      - Condition: "{% $toMillis($states.context.State.EnteredTime) - $queued_at >= $max_wait_s * 1000 and $lock_name = 'tally' %}"
+        Assign: { lock_path: unlocked after queue limit }
+        Next: MarkTallyLock
     Default: WaitForLock
 
   WaitForLock:
@@ -456,7 +484,7 @@ States:
       ExpressionAttributeNames: { "#s": status, "#e": error }
       ExpressionAttributeValues:
         ":s": { S: BUSY }
-        ":e": { S: "{% 'Another run held the swarm lock for the whole ' & $string($lock_max_wait_s) & ' s queue limit.' %}" }
+        ":e": { S: "{% 'Another run held the swarm lock for the whole ' & $string($max_wait_s) & ' s queue limit.' %}" }
         ":w": { N: "{% $string($round(($toMillis($states.context.State.EnteredTime) - $queued_at) / 1000)) %}" }
     Catch:
       - ErrorEquals: [States.ALL]
@@ -811,6 +839,41 @@ States:
       ExpressionAttributeNames: { "#s": status }
       ExpressionAttributeValues: { ":s": { S: TALLY } }
     Output: {}
+    Next: RequestTallyLock
+
+  # Lease: 3 Tally attempts of up to 600 s each plus the retry waits stay under 2,100 s.
+  RequestTallyLock:
+    Type: Pass
+    Assign:
+      lock_name: tally
+      lease_s: 2100
+      max_wait_s: 2400
+      queued_at: "{% $toMillis($states.context.State.EnteredTime) %}"
+      lock_path: free
+    Next: AcquireLock
+
+  MarkTallyLock:
+    Type: Task
+    Resource: arn:aws:states:::dynamodb:updateItem
+    Arguments:
+      TableName: ${TableName}
+      Key:
+        pk: { S: "{% 'run#' & $run_id %}" }
+        sk: { S: META }
+      UpdateExpression: "SET tally_queue_wait_s = :w, tally_lock_path = :p"
+      ExpressionAttributeValues:
+        ":w": { N: "{% $string($round(($toMillis($states.context.State.EnteredTime) - $queued_at) / 1000)) %}" }
+        ":p": { S: "{% $lock_path %}" }
+    Retry:
+      - ErrorEquals: [States.ALL]
+        IntervalSeconds: 1
+        BackoffRate: 2
+        MaxAttempts: 3
+    Output: {}
+    Catch:
+      - ErrorEquals: [States.ALL]
+        Assign: { err: "{% $states.errorOutput %}" }
+        Next: ReleaseOnFail
     Next: Tally
 
   # ---- 4. Tally: themes, classification, counts in code, fixes (one Lambda) ----
@@ -833,6 +896,13 @@ States:
         IntervalSeconds: 2
         BackoffRate: 2
         MaxAttempts: 3
+      # F04 safety net: Tally's own backoff ran out of time budget on Nova throttling. Tally only overwrites
+      # its S3 results, so a re-invoke is safe.
+      - ErrorEquals: [ThrottlingException, ServiceUnavailableException]
+        IntervalSeconds: 30
+        BackoffRate: 2
+        MaxAttempts: 2
+        JitterStrategy: FULL
     Assign:
       tally: "{% $states.result.Payload %}"
     Output: {}
@@ -840,6 +910,28 @@ States:
       - ErrorEquals: [States.ALL]
         Assign: { err: "{% $states.errorOutput %}" }
         Next: ReleaseOnFail
+    Next: ReleaseTallyLock
+
+  ReleaseTallyLock:
+    Type: Task
+    Resource: arn:aws:states:::dynamodb:deleteItem
+    Arguments:
+      TableName: ${TableName}
+      Key:
+        pk: { S: "lock#tally" }
+        sk: { S: LEASE }
+      ConditionExpression: "holder = :me"
+      ExpressionAttributeValues:
+        ":me": { S: "{% $states.context.Execution.Id %}" }
+    Retry:
+      - ErrorEquals: [DynamoDB.ProvisionedThroughputExceededException, DynamoDB.ThrottlingException, DynamoDB.InternalServerErrorException]
+        IntervalSeconds: 1
+        BackoffRate: 2
+        MaxAttempts: 4
+    Output: {}
+    Catch:
+      - ErrorEquals: [States.ALL]
+        Next: Save
     Next: Save
 
   # ---- 5. Save ----
@@ -930,6 +1022,28 @@ States:
       TableName: ${TableName}
       Key:
         pk: { S: "lock#swarm" }
+        sk: { S: LEASE }
+      ConditionExpression: "holder = :me"
+      ExpressionAttributeValues:
+        ":me": { S: "{% $states.context.Execution.Id %}" }
+    Retry:
+      - ErrorEquals: [DynamoDB.ProvisionedThroughputExceededException, DynamoDB.ThrottlingException, DynamoDB.InternalServerErrorException]
+        IntervalSeconds: 1
+        BackoffRate: 2
+        MaxAttempts: 4
+    Output: {}
+    Catch:
+      - ErrorEquals: [States.ALL]
+        Next: ReleaseTallyOnFail
+    Next: ReleaseTallyOnFail
+
+  ReleaseTallyOnFail:
+    Type: Task
+    Resource: arn:aws:states:::dynamodb:deleteItem
+    Arguments:
+      TableName: ${TableName}
+      Key:
+        pk: { S: "lock#tally" }
         sk: { S: LEASE }
       ConditionExpression: "holder = :me"
       ExpressionAttributeValues:

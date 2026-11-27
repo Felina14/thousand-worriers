@@ -114,14 +114,16 @@ The stack sends every alarm to one SNS topic. Its email subscription uses `ALARM
 
 - **worry-run-failed**: open the failed execution in Step Functions, read the run's META `error`, and rerun the plan once the cause is fixed. Error `RunBusy` with META status `BUSY` means the run queued for the swarm lock for 20 minutes and gave up before calling Nova Micro; check the `lock#swarm` item in the table for a stuck holder.
 - **lost-worriers**: a finished run saved fewer worriers than it launched. META splits the loss by cause: `lost_throttle`, `lost_parse`, `lost_partial`, `lost_write` and `lost_other`, with the last error name in `last_fail_error`. Tell users the count shown is lower.
-- **tally-fallback**: the v2 tally hit an error (usually Nova throttling) and the run used v1; read the run's `tally_error` and rerun when Bedrock is quiet.
+- **tally-fallback**: the v2 tally hit an error and the run used v1; read the run's `tally_error`. If it names throttling, check `tally_lock_path` for `unlocked after queue limit` and for another workload that calls Nova Pro.
 - **tally-errors**: read the Tally Lambda log for the stack trace and fix or redeploy; the run is marked FAILED.
 - **tally-throttles**: the account Lambda concurrency limit (10) was hit; space out runs or request a concurrency increase.
 - **bedrock-throttles-nova-micro / -nova-lite / -nova-pro**: Nova requests were throttled (retries absorb some); if it repeats, slow new runs or request a quota increase for that model.
 
-### One swarm at a time
+### One swarm and one tally at a time
 
-Nova Micro allows 200 requests per minute for the whole account, and one swarm keeps 6 requests in flight, which is about that rate. The state machine therefore holds a lease lock (the `lock#swarm` item in DynamoDB) while a run's swarm is running. A second run waits in status `QUEUED` and checks the lock every 10 seconds. It takes the lock over when the lease is more than 15 minutes old or when the execution holding it has stopped. After 20 minutes in the queue it ends `BUSY`. Grid and tally steps run outside the lock.
+Nova Micro allows 200 requests per minute for the whole account, and one swarm keeps 6 requests in flight, which is about that rate. Nova Pro allows 13 requests per minute, and the tally sends its Pro calls one at a time, at most 12 a minute. The state machine therefore holds two lease locks in DynamoDB: `lock#swarm` while a run's swarm is running, and `lock#tally` while its tally is running. The leases are separate, so one run can swarm while another tallies.
+
+A run that finds a lease taken waits and checks every 10 seconds. It takes the lease over when the holder execution has stopped or the lease has expired (15 minutes for the swarm, 35 for the tally), and META `lock_path` / `tally_lock_path` records how it got the lease. After 20 minutes in the swarm queue the run ends `BUSY` before calling Nova Micro. After 40 minutes in the tally queue the tally runs without the lease, and `tally_lock_path` says `unlocked after queue limit`. Throttled Nova calls in the tally back off with full jitter until 30 seconds before the Lambda timeout. Step Functions then retries the tally twice more.
 
 ## Cost and speed
 

@@ -16,10 +16,13 @@ import os
 import sys
 import random
 import re
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 import boto3
 from botocore.config import Config
+from botocore.exceptions import ClientError
 
 TABLE = os.environ["TABLE_NAME"]
 LITE = os.environ["LITE_MODEL"]
@@ -29,7 +32,19 @@ SAMPLE = 150
 BATCH = 50
 
 ddb = boto3.client("dynamodb")
-br = boto3.client("bedrock-runtime", config=Config(retries={"max_attempts": 10, "mode": "adaptive"}, read_timeout=120))
+# F04 (REL01-BP04): ask_retry owns throttling (backoff with full jitter inside the Lambda's time budget), so the
+# SDK only does a few quick retries. The SDK's own retry quota emptied under load and then failed calls at once.
+br = boto3.client("bedrock-runtime", config=Config(retries={"max_attempts": 3, "mode": "standard"}, read_timeout=120))
+
+# F04: Nova Pro on-demand allows 13 requests per minute for the whole account. Tally sends its Pro calls one at
+# a time, at most PRO_RPM per minute; the state machine runs one tally at a time (lock#tally), so the account
+# stays under the quota. Nova Lite (100 RPM) keeps its parallel pools.
+PRO_RPM = float(os.environ.get("PRO_RPM", "12"))
+_pro_gate = threading.Lock()
+_pro_last = [0.0]
+THROTTLE_CODES = {"ThrottlingException", "ServiceUnavailableException", "TooManyRequestsException"}
+BACKOFF_BASE_S, BACKOFF_CAP_S = 2.0, 60.0
+DEADLINE = [float("inf")]  # time.monotonic() after which no new backoff starts; set per invocation in handler()
 
 KINDNESS = (
     "Honesty and kindness rules for every fix and backup: never deceive, mislead, lie to, manipulate or pressure "
@@ -60,13 +75,25 @@ class Usage:
             self.t[k] += v
 
 
-def ask(usage, model, system, prompt, max_tokens, temperature):
-    resp = br.converse(
+def _converse(model, system, prompt, max_tokens, temperature):
+    return br.converse(
         modelId=model,
         system=[{"text": system}],
         messages=[{"role": "user", "content": [{"text": prompt}]}],
         inferenceConfig={"maxTokens": max_tokens, "temperature": temperature},
     )
+
+
+def ask(usage, model, system, prompt, max_tokens, temperature):
+    if model == PRO:
+        with _pro_gate:  # one Pro call at a time, spaced to stay under PRO_RPM
+            wait = _pro_last[0] + 60.0 / PRO_RPM - time.monotonic()
+            if wait > 0:
+                time.sleep(wait)
+            _pro_last[0] = time.monotonic()
+            resp = _converse(model, system, prompt, max_tokens, temperature)
+    else:
+        resp = _converse(model, system, prompt, max_tokens, temperature)
     usage.add(model, resp)
     text = resp["output"]["message"]["content"][0]["text"]
     m = re.search(r"\{[\s\S]*\}", text)
@@ -75,15 +102,30 @@ def ask(usage, model, system, prompt, max_tokens, temperature):
     return json.loads(m.group(0))
 
 
+def is_throttle(e):
+    return isinstance(e, ClientError) and e.response.get("Error", {}).get("Code") in THROTTLE_CODES
+
+
 def ask_retry(usage, model, system, prompt, max_tokens, check, temperature=0.2, tries=3):
-    last = None
-    for _ in range(tries):
+    """`tries` attempts for unusable output. Throttling is retried separately with exponential backoff and full
+    jitter for as long as the invocation's time budget allows; then the throttle error is raised unchanged
+    (the state machine retries Tally on ThrottlingException as a last safety net)."""
+    last, bad, n_throttle = None, 0, 0
+    while bad < tries:
         try:
             out = ask(usage, model, system, prompt, max_tokens, temperature)
             check(out)
             return out
         except (ValueError, KeyError, TypeError, json.JSONDecodeError) as e:
-            last = e
+            last, bad = e, bad + 1
+        except ClientError as e:
+            if not is_throttle(e):
+                raise
+            delay = random.uniform(0, min(BACKOFF_CAP_S, BACKOFF_BASE_S * 2 ** n_throttle))
+            if time.monotonic() + delay >= DEADLINE[0]:
+                raise
+            n_throttle += 1
+            time.sleep(delay)
     raise RuntimeError(f"model output unusable after {tries} tries: {last}")
 
 
@@ -456,6 +498,9 @@ def find_quiet(usage, worries, labels, counts, parent):
 
 def handler(event, _ctx):
     """Tally v2 (worrycore) when the run asks for it or TALLY_V2=1; any v2 failure falls back to v1 (marked)."""
+    # Stop starting backoffs 30 s before the Lambda timeout so a throttled call fails cleanly instead of timing out.
+    remaining = _ctx.get_remaining_time_in_millis() / 1000 if _ctx else 600
+    DEADLINE[0] = time.monotonic() + remaining - 30
     want = str(event.get("tally") or "").lower()
     if want == "v2" or (os.environ.get("TALLY_V2") == "1" and want != "v1"):
         try:
