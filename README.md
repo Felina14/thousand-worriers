@@ -117,6 +117,7 @@ The stack sends every alarm to one SNS topic. Its email subscription uses `ALARM
 - **tally-fallback**: the v2 tally hit an error and the run used v1; read the run's `tally_error`. If it names throttling, check `tally_lock_path` for `unlocked after queue limit` and for another workload that calls Nova Pro.
 - **tally-errors**: read the Tally Lambda log for the stack trace and fix or redeploy; the run is marked FAILED.
 - **tally-throttles**: the account Lambda concurrency limit (10) was hit; space out runs or request a concurrency increase.
+- **lambda-concurrency-80pct**: Lambda functions in this account ran 8 of the 10 allowed concurrent executions, so the next Tally may throttle. Check which functions use the concurrency, space out runs, or request a concurrency increase in Service Quotas (quota L-B99A9384).
 - **bedrock-throttles-nova-micro / -nova-lite / -nova-pro**: Nova requests were throttled (retries absorb some); if it repeats, slow new runs or request a quota increase for that model.
 
 ### One swarm and one tally at a time

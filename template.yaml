@@ -752,6 +752,25 @@ Resources:
       AlarmActions: [!Ref AlarmTopic]
       OKActions: [!Ref AlarmTopic]
 
+  # F04 (REL01-BP04): warn at 80% of the account's Lambda concurrency quota (L-B99A9384, 10 at the time of
+  # writing) before Tally invocations throttle. Account-wide metric with no dimensions; raise the threshold
+  # with the quota.
+  LambdaConcurrencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-lambda-concurrency-80pct"
+      AlarmDescription: Account Lambda concurrent executions reached 8 of the 10 allowed (80 percent). Response in README.
+      Namespace: AWS/Lambda
+      MetricName: ConcurrentExecutions
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 8
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+      OKActions: [!Ref AlarmTopic]
+
   # Bedrock metrics are account-wide per ModelId. Micro is called through the us. inference profile;
   # Lite is called by ARN (Grid) and by model id (Tally), so its alarm adds both series.
   MicroThrottlesAlarm:
