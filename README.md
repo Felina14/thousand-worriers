@@ -112,12 +112,16 @@ The tests stub all Bedrock calls, so they cost nothing.
 
 The stack sends every alarm to one SNS topic. Its email subscription uses `ALARM_EMAIL` from `.env` (or `ALERT_EMAIL` when unset); confirm the subscription email once after the first deploy. One response per alarm:
 
-- **worry-run-failed**: open the failed execution in Step Functions, read the run's META `error`, and rerun the plan once the cause is fixed.
-- **lost-worriers**: a finished run saved fewer worriers than it launched; check the Map Run's failed items and Bedrock throttles in the same minute, and tell users the count shown is lower.
+- **worry-run-failed**: open the failed execution in Step Functions, read the run's META `error`, and rerun the plan once the cause is fixed. Error `RunBusy` with META status `BUSY` means the run queued for the swarm lock for 20 minutes and gave up before calling Nova Micro; check the `lock#swarm` item in the table for a stuck holder.
+- **lost-worriers**: a finished run saved fewer worriers than it launched. META splits the loss by cause: `lost_throttle`, `lost_parse`, `lost_partial`, `lost_write` and `lost_other`, with the last error name in `last_fail_error`. Tell users the count shown is lower.
 - **tally-fallback**: the v2 tally hit an error (usually Nova throttling) and the run used v1; read the run's `tally_error` and rerun when Bedrock is quiet.
 - **tally-errors**: read the Tally Lambda log for the stack trace and fix or redeploy; the run is marked FAILED.
 - **tally-throttles**: the account Lambda concurrency limit (10) was hit; space out runs or request a concurrency increase.
 - **bedrock-throttles-nova-micro / -nova-lite / -nova-pro**: Nova requests were throttled (retries absorb some); if it repeats, slow new runs or request a quota increase for that model.
+
+### One swarm at a time
+
+Nova Micro allows 200 requests per minute for the whole account, and one swarm keeps 6 requests in flight, which is about that rate. The state machine therefore holds a lease lock (the `lock#swarm` item in DynamoDB) while a run's swarm is running. A second run waits in status `QUEUED` and checks the lock every 10 seconds. It takes the lock over when the lease is more than 15 minutes old or when the execution holding it has stopped. After 20 minutes in the queue it ends `BUSY`. Grid and tally steps run outside the lock.
 
 ## Cost and speed
 

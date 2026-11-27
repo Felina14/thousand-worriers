@@ -717,7 +717,7 @@
   function resetUI() {
     S.token++;
     clearTimeout(S.pollT); clearInterval(S.drainT); Status.stop();
-    S.queue = []; S.spoken = new Set(); S.castDone = false; S.casting = false; S.fullLoaded = false; S.finishing = false; S.sevSum = 0; S.replay = false;
+    S.queue = []; S.spoken = new Set(); S.castDone = false; S.casting = false; S.fullLoaded = false; S.finishing = false; S.sevSum = 0; S.replay = false; S.queuedShown = false;
     G.killTweensOf(el.cards.children);
     el.cards.innerHTML = ""; el.spot.hidden = true; el.quiet.hidden = true; el.results.hidden = true; el.calm.hidden = true; el.hover.hidden = true;
     Stage.el.querySelectorAll(".stamp").forEach((s) => s.remove());
@@ -859,6 +859,7 @@
     poll(token);
   }
 
+  const QUEUED_LINE = "Another plan is being worried about. Yours is next in line…";
   async function poll(token) {
     if (token !== S.token) return;
     const r = S.run;
@@ -870,7 +871,11 @@
       if (typeof meta.calls === "number") Stats.calls(meta.calls);
       Stats.times(meta.created_at ? Date.parse(meta.created_at) : 0, meta.status === "DONE" && meta.finished_at ? Date.parse(meta.finished_at) : 0);
       if (meta.status === "FAILED") { Status.stop(); Status.set("This run fell over. Please try again."); Meter.live(false); el.cards.innerHTML = ""; return; }
-      if (meta.grid && !S.castDone && !S.casting && !r.isRetest) castGrid(meta.grid, token).then(() => { if (token === S.token && !S.finishing) { Status.set("Places, everyone. Begin worrying!"); setTimeout(() => { if (token === S.token && !S.finishing && S.phase === "casting") Status.rotate(panicLines, 2100); }, 1600); } });
+      // F05: one swarm runs at a time; a queued run waits, and gives up cleanly (BUSY) after the queue limit.
+      if (meta.status === "BUSY") { Status.stop(); Status.set("The worriers are busy with other plans. Nothing was used. Please try again in a few minutes."); Meter.live(false); el.cards.innerHTML = ""; return; }
+      if (meta.status === "QUEUED" && !S.queuedShown && !S.casting) { S.queuedShown = true; Status.stop(); Status.set(QUEUED_LINE); }
+      if (meta.grid && !S.castDone && !S.casting && !r.isRetest) castGrid(meta.grid, token).then(() => { if (token === S.token && !S.finishing && S.run.status === "QUEUED") { S.queuedShown = true; Status.set(QUEUED_LINE); return; } if (token === S.token && !S.finishing) { Status.set("Places, everyone. Begin worrying!"); setTimeout(() => { if (token === S.token && !S.finishing && S.phase === "casting") Status.rotate(panicLines, 2100); }, 1600); } });
+      if (S.queuedShown && meta.status === "SWARM") { S.queuedShown = false; if (S.castDone && !r.isRetest) Status.rotate(panicLines, 2100); }
       if (["SWARM", "TALLY", "DONE"].includes(meta.status)) {
         if (meta.status === "DONE" && !S.fullLoaded) {
           const { worries } = await API.worries(r.id, 1000);

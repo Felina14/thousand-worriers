@@ -203,6 +203,12 @@ Resources:
               - Effect: Allow
                 Action: [dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:GetItem, dynamodb:BatchWriteItem]
                 Resource: !GetAtt WorriersTable.Arn
+              - Sid: SwarmLeaseRelease   # F05: only the swarm lock item is ever deleted
+                Effect: Allow
+                Action: dynamodb:DeleteItem
+                Resource: !GetAtt WorriersTable.Arn
+                Condition:
+                  ForAllValues:StringEquals: { "dynamodb:LeadingKeys": ["lock#swarm"] }
               - Effect: Allow
                 Action: lambda:InvokeFunction
                 Resource: [!GetAtt TallyFunction.Arn, !Sub "${TallyFunction.Arn}:*"]

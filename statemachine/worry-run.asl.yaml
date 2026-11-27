@@ -1,8 +1,10 @@
 Comment: >-
   1,000 Worriers - one run. Grid (Nova Lite) -> items -> swarm (Nova Micro, Distributed Map,
-  5 worriers per request) -> tally (Lambda) -> save.
+  5 worriers per request) -> tally (Lambda) -> save. One swarm at a time account-wide (F05 lease lock).
 QueryLanguage: JSONata
 StartAt: Init
+# Hard stop so a run can never hang (F05). Typical worst case: 1,200 s queue + ~900 s swarm + 600 s tally.
+TimeoutSeconds: 3600
 States:
 
   Init:
@@ -23,6 +25,9 @@ States:
       revision: null
       lite_in: 0
       lite_out: 0
+      # F05: how long a run may queue for the swarm lock before it ends BUSY (20-1,200 s, default 1,200).
+      lock_max_wait_s: "{% $exists($states.input.lock_max_wait_s) ? $min([$max([20, $floor($number($string($states.input.lock_max_wait_s)))]), 1200]) : 1200 %}"
+      lock_path: free
     Next: IsRetest
 
   IsRetest:
@@ -225,7 +230,7 @@ States:
         Next: GridRetry
       - ErrorEquals: [States.ALL]
         Assign: { err: "{% $states.errorOutput %}" }
-        Next: MarkFailed
+        Next: ReleaseOnFail
     Next: BuildItems
 
   GridRetry:
@@ -233,7 +238,7 @@ States:
     Choices:
       - Condition: "{% $grid_tries < 3 %}"
         Next: Grid
-    Default: MarkFailed
+    Default: ReleaseOnFail
 
   # ---- 2. Items: shuffle the character x angle pairs; about 10% of pairs (at least 2, when it exists) use the
   # "what the people affected actually want" angle (the affected card needs a real sub-panel); expand each pair to its 5 moments in order;
@@ -280,7 +285,7 @@ States:
     Catch:
       - ErrorEquals: [States.ALL]
         Assign: { err: "{% $states.errorOutput %}" }
-        Next: MarkFailed
+        Next: ReleaseOnFail
     Next: SaveGrid
 
   SaveGrid:
@@ -294,17 +299,199 @@ States:
       UpdateExpression: "SET #s = :s, n = :n, grid = :g, items_key = :k ADD lite_in :li, lite_out :lo"
       ExpressionAttributeNames: { "#s": status }
       ExpressionAttributeValues:
-        ":s": { S: SWARM }
+        ":s": { S: QUEUED }
         ":n": { N: "{% $string($n_items) %}" }
         ":g": { S: "{% $string($grid) %}" }
         ":k": { S: "{% $items_key %}" }
         ":li": { N: "{% $string($lite_in) %}" }
         ":lo": { N: "{% $string($lite_out) %}" }
+    Assign:
+      queued_at: "{% $toMillis($states.context.State.EnteredTime) %}"
     Output: {}
     Catch:
       - ErrorEquals: [States.ALL]
         Assign: { err: "{% $states.errorOutput %}" }
-        Next: MarkFailed
+        Next: ReleaseOnFail
+    Next: AcquireLock
+
+  # ---- F05 (REL04-BP02, REL05-BP04) / F04 (REL01-BP04): global admission control on the Nova Micro fan-out ----
+  # One swarm at a time across all runs. MaxConcurrency 6 below is sized for ONE run under the 200 RPM
+  # Nova Micro quota; before this lock, N concurrent runs put 6N requests in flight against that one quota.
+  # The lock is a lease: holder = execution ARN, expiresAt = acquire time + 900 s (a lone swarm takes ~2 min).
+  # Every exit the run can catch releases it (ReleaseLock after Swarm, ReleaseOnFail on every Catch).
+  # Exits it cannot catch (StopExecution, the 3,600 s execution timeout) are covered by the waiters:
+  # they take the lease over when it expired or when the holder execution is no longer RUNNING.
+  # (A Distributed Map has no TimeoutSeconds; a swarm that outruns its lease just loses the lock.)
+  AcquireLock:
+    Type: Task
+    Resource: arn:aws:states:::dynamodb:putItem
+    Arguments:
+      TableName: ${TableName}
+      Item:
+        pk: { S: "lock#swarm" }
+        sk: { S: LEASE }
+        holder: { S: "{% $states.context.Execution.Id %}" }
+        run_id: { S: "{% $run_id %}" }
+        acquiredAt: { S: "{% $states.context.State.EnteredTime %}" }
+        expiresAt: { N: "{% $string($floor($toMillis($states.context.State.EnteredTime) / 1000) + 900) %}" }
+        ttl: { N: "{% $string($floor($toMillis($states.context.State.EnteredTime) / 1000) + 86400) %}" }
+      ConditionExpression: "attribute_not_exists(pk) OR expiresAt < :now OR holder = :me"
+      ExpressionAttributeValues:
+        ":now": { N: "{% $string($floor($toMillis($states.context.State.EnteredTime) / 1000)) %}" }
+        ":me": { S: "{% $states.context.Execution.Id %}" }
+    Retry:
+      - ErrorEquals: [DynamoDB.ProvisionedThroughputExceededException, DynamoDB.ThrottlingException, DynamoDB.InternalServerErrorException]
+        IntervalSeconds: 1
+        BackoffRate: 2
+        MaxAttempts: 4
+    Output: {}
+    Catch:
+      - ErrorEquals: [DynamoDB.ConditionalCheckFailedException]
+        Next: ReadLock
+      - ErrorEquals: [States.ALL]
+        Assign: { err: "{% $states.errorOutput %}" }
+        Next: ReleaseOnFail
+    Next: MarkSwarm
+
+  ReadLock:
+    Type: Task
+    Resource: arn:aws:states:::dynamodb:getItem
+    Arguments:
+      TableName: ${TableName}
+      Key:
+        pk: { S: "lock#swarm" }
+        sk: { S: LEASE }
+      ConsistentRead: true
+    Assign:
+      lock: "{% $exists($states.result.Item) ? $states.result.Item : null %}"
+    Output: {}
+    Catch:
+      - ErrorEquals: [States.ALL]
+        Next: QueueCheck
+    Next: LockState
+
+  LockState:
+    Type: Choice
+    Choices:
+      - Condition: "{% $type($lock) != 'object' %}"
+        Next: AcquireLock
+      - Condition: "{% $number($lock.expiresAt.N) < $floor($toMillis($states.context.State.EnteredTime) / 1000) %}"
+        Assign: { lock_path: expired }
+        Next: AcquireLock
+    Default: CheckHolder
+
+  # Liveness of the holder: a killed, timed-out or failed execution cannot release, so a waiter takes over.
+  CheckHolder:
+    Type: Task
+    Resource: arn:aws:states:::aws-sdk:sfn:describeExecution
+    Arguments:
+      ExecutionArn: "{% $lock.holder.S %}"
+    Assign:
+      holder_status: "{% $states.result.Status %}"
+    Output: {}
+    Catch:
+      - ErrorEquals: [Sfn.ExecutionDoesNotExistException]
+        Assign: { holder_status: GONE }
+        Next: HolderAlive
+      - ErrorEquals: [States.ALL]
+        Next: QueueCheck
+    Next: HolderAlive
+
+  HolderAlive:
+    Type: Choice
+    Choices:
+      - Condition: "{% $holder_status = 'RUNNING' %}"
+        Next: QueueCheck
+    Default: TakeOver
+
+  TakeOver:
+    Type: Task
+    Resource: arn:aws:states:::dynamodb:putItem
+    Arguments:
+      TableName: ${TableName}
+      Item:
+        pk: { S: "lock#swarm" }
+        sk: { S: LEASE }
+        holder: { S: "{% $states.context.Execution.Id %}" }
+        run_id: { S: "{% $run_id %}" }
+        acquiredAt: { S: "{% $states.context.State.EnteredTime %}" }
+        expiresAt: { N: "{% $string($floor($toMillis($states.context.State.EnteredTime) / 1000) + 900) %}" }
+        ttl: { N: "{% $string($floor($toMillis($states.context.State.EnteredTime) / 1000) + 86400) %}" }
+        took_over_from: { S: "{% $lock.holder.S & ' (' & $holder_status & ')' %}" }
+      ConditionExpression: "holder = :old"
+      ExpressionAttributeValues:
+        ":old": { S: "{% $lock.holder.S %}" }
+    Assign:
+      lock_path: "{% 'takeover from ' & $holder_status %}"
+    Output: {}
+    Catch:
+      - ErrorEquals: [DynamoDB.ConditionalCheckFailedException]
+        Next: ReadLock
+      - ErrorEquals: [States.ALL]
+        Assign: { err: "{% $states.errorOutput %}" }
+        Next: ReleaseOnFail
+    Next: MarkSwarm
+
+  QueueCheck:
+    Type: Choice
+    Choices:
+      - Condition: "{% $toMillis($states.context.State.EnteredTime) - $queued_at >= $lock_max_wait_s * 1000 %}"
+        Next: MarkBusy
+    Default: WaitForLock
+
+  WaitForLock:
+    Type: Wait
+    Seconds: 10
+    Next: AcquireLock
+
+  MarkBusy:
+    Type: Task
+    Resource: arn:aws:states:::dynamodb:updateItem
+    Arguments:
+      TableName: ${TableName}
+      Key:
+        pk: { S: "{% 'run#' & $run_id %}" }
+        sk: { S: META }
+      UpdateExpression: "SET #s = :s, #e = :e, queue_wait_s = :w"
+      ExpressionAttributeNames: { "#s": status, "#e": error }
+      ExpressionAttributeValues:
+        ":s": { S: BUSY }
+        ":e": { S: "{% 'Another run held the swarm lock for the whole ' & $string($lock_max_wait_s) & ' s queue limit.' %}" }
+        ":w": { N: "{% $string($round(($toMillis($states.context.State.EnteredTime) - $queued_at) / 1000)) %}" }
+    Catch:
+      - ErrorEquals: [States.ALL]
+        Next: RunBusy
+    Next: RunBusy
+
+  RunBusy:
+    Type: Fail
+    Error: RunBusy
+    Cause: All swarm slots stayed busy for the queue limit. META status BUSY; nothing was sent to Nova Micro.
+
+  MarkSwarm:
+    Type: Task
+    Resource: arn:aws:states:::dynamodb:updateItem
+    Arguments:
+      TableName: ${TableName}
+      Key:
+        pk: { S: "{% 'run#' & $run_id %}" }
+        sk: { S: META }
+      UpdateExpression: "SET #s = :s, queue_wait_s = :w, lock_path = :p"
+      ExpressionAttributeNames: { "#s": status }
+      ExpressionAttributeValues:
+        ":s": { S: SWARM }
+        ":w": { N: "{% $string($round(($toMillis($states.context.State.EnteredTime) - $queued_at) / 1000)) %}" }
+        ":p": { S: "{% $lock_path %}" }
+    Retry:
+      - ErrorEquals: [States.ALL]
+        IntervalSeconds: 1
+        BackoffRate: 2
+        MaxAttempts: 3
+    Output: {}
+    Catch:
+      - ErrorEquals: [States.ALL]
+        Assign: { err: "{% $states.errorOutput %}" }
+        Next: ReleaseOnFail
     Next: Swarm
 
   # ---- 3. Swarm: each Nova Micro request carries five worriers (one character+angle, 5 moments) ----
@@ -324,6 +511,7 @@ States:
         plan: "{% $plan %}"
         grid: "{% $grid %}"
     # 200 requests for 1,000 worriers; 6 in flight at ~2-3 s each stays under the 200 RPM quota.
+    # That sizing holds account-wide only because AcquireLock admits one swarm at a time (F05).
     MaxConcurrency: 6
     ToleratedFailurePercentage: 10
     ItemProcessor:
@@ -393,9 +581,10 @@ States:
               BackoffRate: 2
               MaxAttempts: 6
               JitterStrategy: FULL
+            # Unusable JSON, or a partial batch (see Output), is re-rolled up to twice (F05: lost-worrier causes).
             - ErrorEquals: [States.QueryEvaluationError]
               IntervalSeconds: 1
-              MaxAttempts: 1
+              MaxAttempts: 2
           Output: >-
             {% (
               $b := $type($states.result.Body) = 'string' ? $parse($states.result.Body) : $states.result.Body;
@@ -415,7 +604,8 @@ States:
                       'missing': $substring($trim($exists($w.missing) ? $string($w.missing) : ''), 0, 120),
                       'cause': $lowercase($substring($trim($exists($w.cause) ? $string($w.cause) : ''), 0, 60)) }
               ) }));
-              $count($ok) = 0 ? $error('no usable worries') : {
+              $count($ok) = 0 ? $error('no usable worries') :
+              ($count($ok) < $count($its) and $states.context.State.RetryCount < 2) ? $error('partial batch') : {
                 'run_id': $states.input.BatchInput.run_id,
                 'ok': $ok,
                 'bad': $count($its) - $count($ok),
@@ -426,7 +616,7 @@ States:
             ) %}
           Catch:
             - ErrorEquals: [States.ALL]
-              Output: "{% $states.input %}"
+              Output: "{% $merge([$states.input, { 'err': $string($states.errorOutput.Error) }]) %}"
               Next: CountFail
           Next: SaveWorries
 
@@ -459,6 +649,10 @@ States:
               MaxAttempts: 5
           Output: >-
             {% $merge([$states.input, { 'unprocessed': $states.result.UnprocessedItems }]) %}
+          Catch:
+            - ErrorEquals: [States.ALL]
+              Output: "{% $merge([$states.input, { 'err': $string($states.errorOutput.Error) }]) %}"
+              Next: CountWriteFail
           Next: AllWritten
 
         AllWritten:
@@ -477,6 +671,11 @@ States:
             RequestItems: "{% $states.input.unprocessed %}"
           Output: >-
             {% $merge([$states.input, { 'unprocessed': $states.result.UnprocessedItems, 'tries': $states.input.tries + 1 }]) %}
+          # On error the previous 'unprocessed' stays in the input, so Bump counts those worries as lost_write.
+          Catch:
+            - ErrorEquals: [States.ALL]
+              Output: "{% $states.input %}"
+              Next: Bump
           Next: AllWritten
 
         Bump:
@@ -488,15 +687,50 @@ States:
             Key:
               pk: { S: "{% 'run#' & $states.input.run_id %}" }
               sk: { S: META }
-            UpdateExpression: "ADD done :d, failed :f, micro_in :i, micro_out :o, micro_calls :one"
+            # Every lost worrier gets a cause (F05): lost_partial = the model returned fewer usable worries than asked,
+            # even after the re-rolls; lost_write = DynamoDB never accepted the item.
+            UpdateExpression: "ADD done :d, failed :f, lost_partial :p, lost_write :w, micro_in :i, micro_out :o, micro_calls :one"
             ExpressionAttributeValues:
-              ":d": { N: "{% $string($count($states.input.ok)) %}" }
-              ":f": { N: "{% $string($states.input.bad) %}" }
+              ":d": { N: "{% $string($count($states.input.ok) - $count($append([], $lookup($states.input.unprocessed, '${TableName}')))) %}" }
+              ":f": { N: "{% $string($states.input.bad + $count($append([], $lookup($states.input.unprocessed, '${TableName}')))) %}" }
+              ":p": { N: "{% $string($states.input.bad) %}" }
+              ":w": { N: "{% $string($count($append([], $lookup($states.input.unprocessed, '${TableName}')))) %}" }
               ":i": { N: "{% $string($states.input.in) %}" }
               ":o": { N: "{% $string($states.input.out) %}" }
               ":one": { N: "1" }
+          Retry:
+            - ErrorEquals: [States.ALL]
+              IntervalSeconds: 1
+              BackoffRate: 2
+              MaxAttempts: 3
           Output: "{% { 'saved': $count($states.input.ok), 'bad': $states.input.bad } %}"
           End: true
+
+        # The first batch write failed outright: nothing of this request was saved.
+        CountWriteFail:
+          Type: Task
+          QueryLanguage: JSONata
+          Resource: arn:aws:states:::dynamodb:updateItem
+          Arguments:
+            TableName: ${TableName}
+            Key:
+              pk: { S: "{% 'run#' & $states.input.run_id %}" }
+              sk: { S: META }
+            UpdateExpression: "SET last_fail_error = :e ADD failed :f, lost_write :k, lost_partial :p, micro_in :i, micro_out :o, micro_calls :one"
+            ExpressionAttributeValues:
+              ":e": { S: "{% $states.input.err %}" }
+              ":f": { N: "{% $string($count($states.input.ok) + $states.input.bad) %}" }
+              ":k": { N: "{% $string($count($states.input.ok)) %}" }
+              ":p": { N: "{% $string($states.input.bad) %}" }
+              ":i": { N: "{% $string($states.input.in) %}" }
+              ":o": { N: "{% $string($states.input.out) %}" }
+              ":one": { N: "1" }
+          Retry:
+            - ErrorEquals: [States.ALL]
+              IntervalSeconds: 1
+              BackoffRate: 2
+              MaxAttempts: 3
+          Next: WorryFailed
 
         CountFail:
           Type: Task
@@ -507,10 +741,22 @@ States:
             Key:
               pk: { S: "{% 'run#' & $states.input.BatchInput.run_id %}" }
               sk: { S: META }
-            UpdateExpression: "ADD failed :k, micro_calls :one"
+            # lost_throttle: Nova Micro still throttled after 6 retries; lost_parse: unusable JSON after 2 re-rolls;
+            # lost_other: any other error (named in last_fail_error).
+            UpdateExpression: "SET last_fail_error = :e ADD failed :k, #c :k, micro_calls :one"
+            ExpressionAttributeNames:
+              "#c": >-
+                {% $states.input.err = 'Bedrock.ThrottlingException' ? 'lost_throttle'
+                   : $states.input.err = 'States.QueryEvaluationError' ? 'lost_parse' : 'lost_other' %}
             ExpressionAttributeValues:
+              ":e": { S: "{% $states.input.err %}" }
               ":k": { N: "{% $string($count($states.input.Items)) %}" }
               ":one": { N: "1" }
+          Retry:
+            - ErrorEquals: [States.ALL]
+              IntervalSeconds: 1
+              BackoffRate: 2
+              MaxAttempts: 3
           Next: WorryFailed
 
         WorryFailed:
@@ -527,7 +773,30 @@ States:
     Catch:
       - ErrorEquals: [States.ALL]
         Assign: { err: "{% $states.errorOutput %}" }
-        Next: MarkFailed
+        Next: ReleaseOnFail
+    Next: ReleaseLock
+
+  # Conditional on holder = this execution: never deletes a lease another run took over.
+  ReleaseLock:
+    Type: Task
+    Resource: arn:aws:states:::dynamodb:deleteItem
+    Arguments:
+      TableName: ${TableName}
+      Key:
+        pk: { S: "lock#swarm" }
+        sk: { S: LEASE }
+      ConditionExpression: "holder = :me"
+      ExpressionAttributeValues:
+        ":me": { S: "{% $states.context.Execution.Id %}" }
+    Retry:
+      - ErrorEquals: [DynamoDB.ProvisionedThroughputExceededException, DynamoDB.ThrottlingException, DynamoDB.InternalServerErrorException]
+        IntervalSeconds: 1
+        BackoffRate: 2
+        MaxAttempts: 4
+    Output: {}
+    Catch:
+      - ErrorEquals: [States.ALL]
+        Next: MarkTally
     Next: MarkTally
 
   MarkTally:
@@ -570,7 +839,7 @@ States:
     Catch:
       - ErrorEquals: [States.ALL]
         Assign: { err: "{% $states.errorOutput %}" }
-        Next: MarkFailed
+        Next: ReleaseOnFail
     Next: Save
 
   # ---- 5. Save ----
@@ -652,6 +921,29 @@ States:
   RunHealthSkipped:
     Type: Pass
     End: true
+
+  # Every failure path comes through here. Harmless when this run never held the lock (condition fails).
+  ReleaseOnFail:
+    Type: Task
+    Resource: arn:aws:states:::dynamodb:deleteItem
+    Arguments:
+      TableName: ${TableName}
+      Key:
+        pk: { S: "lock#swarm" }
+        sk: { S: LEASE }
+      ConditionExpression: "holder = :me"
+      ExpressionAttributeValues:
+        ":me": { S: "{% $states.context.Execution.Id %}" }
+    Retry:
+      - ErrorEquals: [DynamoDB.ProvisionedThroughputExceededException, DynamoDB.ThrottlingException, DynamoDB.InternalServerErrorException]
+        IntervalSeconds: 1
+        BackoffRate: 2
+        MaxAttempts: 4
+    Output: {}
+    Catch:
+      - ErrorEquals: [States.ALL]
+        Next: MarkFailed
+    Next: MarkFailed
 
   MarkFailed:
     Type: Task
