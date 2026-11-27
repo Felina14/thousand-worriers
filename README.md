@@ -128,7 +128,7 @@ A run that finds a lease taken waits and checks every 10 seconds. It takes the l
 
 ## Cost and speed
 
-A recorded production run on a database migration plan produced 900 worriers in 209.5 seconds and cost $0.060 in Bedrock inference. Its re-test took 112.9 seconds and cost $0.017. Between runs you pay only for storage; DynamoDB items expire after 30 days.
+A recorded production run on a database migration plan produced 900 worriers in 209.5 seconds and cost $0.060 in Bedrock inference. Its re-test took 112.9 seconds and cost $0.017. Between runs you pay only for storage. DynamoDB expires a run's META item and its saved revisions after 30 days, but the run's worrier (W#) items have no TTL and stay in the table until someone deletes them (Well-Architected review finding F09).
 
 ## Limits
 
