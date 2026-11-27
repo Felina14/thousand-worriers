@@ -32,6 +32,14 @@ Parameters:
     Type: String
     Default: us.amazon.nova-micro-v1:0
     AllowedValues: [us.amazon.nova-micro-v1:0]
+  AlarmEmail:
+    Type: String
+    NoEcho: true
+    Default: ""
+    Description: Email that receives the CloudWatch alarm notifications. Passed at deploy time from the untracked .env, never stored in git.
+
+Conditions:
+  HasAlarmEmail: !Not [!Equals [!Ref AlarmEmail, ""]]
 
 Resources:
   # ---------- Data ----------
@@ -209,6 +217,12 @@ Resources:
                 Effect: Allow
                 Action: [s3:PutObject, s3:GetObject, s3:ListMultipartUploadParts, s3:AbortMultipartUpload]
                 Resource: !Sub "${AppBucket.Arn}/results/*"
+              - Sid: RunHealthMetrics
+                Effect: Allow
+                Action: cloudwatch:PutMetricData
+                Resource: "*"
+                Condition:
+                  StringEquals: { "cloudwatch:namespace": ThousandWorriers }
 
   WorryRun:
     Type: AWS::Serverless::StateMachine
@@ -223,6 +237,7 @@ Resources:
         LiteModel: !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/${LiteModelId}"
         MicroModel: !Sub "arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/${MicroProfileId}"
         TallyFunctionArn: !GetAtt TallyFunction.Arn
+        StackName: !Ref AWS::StackName
 
   TallyFunction:
     Type: AWS::Serverless::Function
@@ -617,6 +632,191 @@ Resources:
           Subscribers:
             - { SubscriptionType: EMAIL, Address: !Ref AlertEmail }
 
+  # ---------- Alarms (F01: lost worriers and failed runs must not be silent) ----------
+  # Each alarm's one-line response is in the README ("When an alarm fires").
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${AWS::StackName}-alarms"
+
+  AlarmTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics: [!Ref AlarmTopic]
+      PolicyDocument:
+        Statement:
+          - Sid: CloudWatchAlarmsOnly
+            Effect: Allow
+            Principal: { Service: cloudwatch.amazonaws.com }
+            Action: sns:Publish
+            Resource: !Ref AlarmTopic
+            Condition:
+              StringEquals: { "aws:SourceAccount": !Ref "AWS::AccountId" }
+
+  AlarmEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlarmEmail
+    Properties:
+      TopicArn: !Ref AlarmTopic
+      Protocol: email
+      Endpoint: !Ref AlarmEmail
+
+  WorryRunFailedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-worry-run-failed"
+      AlarmDescription: A worry run ended FAILED. Response in README.
+      Namespace: AWS/States
+      MetricName: ExecutionsFailed
+      Dimensions: [{ Name: StateMachineArn, Value: !Ref WorryRun }]
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+      OKActions: [!Ref AlarmTopic]
+
+  LostWorriersAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-lost-worriers"
+      AlarmDescription: A finished run saved fewer worriers than it launched (published by the state machine). Response in README.
+      Namespace: ThousandWorriers
+      MetricName: LostWorriers
+      Dimensions: [{ Name: StackName, Value: !Ref AWS::StackName }]
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+      OKActions: [!Ref AlarmTopic]
+
+  TallyFallbackAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-tally-fallback"
+      AlarmDescription: The tally fell back from v2 to v1 (published by the state machine). Response in README.
+      Namespace: ThousandWorriers
+      MetricName: TallyFallback
+      Dimensions: [{ Name: StackName, Value: !Ref AWS::StackName }]
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+      OKActions: [!Ref AlarmTopic]
+
+  TallyErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-tally-errors"
+      AlarmDescription: The Tally Lambda returned an error. Response in README.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions: [{ Name: FunctionName, Value: !Ref TallyFunction }]
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+      OKActions: [!Ref AlarmTopic]
+
+  TallyThrottlesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-tally-throttles"
+      AlarmDescription: The Tally Lambda was throttled (account concurrency). Response in README.
+      Namespace: AWS/Lambda
+      MetricName: Throttles
+      Dimensions: [{ Name: FunctionName, Value: !Ref TallyFunction }]
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+      OKActions: [!Ref AlarmTopic]
+
+  # Bedrock metrics are account-wide per ModelId. Micro is called through the us. inference profile;
+  # Lite is called by ARN (Grid) and by model id (Tally), so its alarm adds both series.
+  MicroThrottlesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-bedrock-throttles-nova-micro"
+      AlarmDescription: Amazon Bedrock throttled Nova Micro calls. Response in README.
+      Namespace: AWS/Bedrock
+      MetricName: InvocationThrottles
+      Dimensions: [{ Name: ModelId, Value: !Ref MicroProfileId }]
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+      OKActions: [!Ref AlarmTopic]
+
+  LiteThrottlesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-bedrock-throttles-nova-lite"
+      AlarmDescription: Amazon Bedrock throttled Nova Lite calls. Response in README.
+      Metrics:
+        - Id: byid
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/Bedrock
+              MetricName: InvocationThrottles
+              Dimensions: [{ Name: ModelId, Value: !Ref LiteModelId }]
+            Period: 60
+            Stat: Sum
+        - Id: byarn
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/Bedrock
+              MetricName: InvocationThrottles
+              Dimensions: [{ Name: ModelId, Value: !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/${LiteModelId}" }]
+            Period: 60
+            Stat: Sum
+        - Id: total
+          Label: Nova Lite throttles
+          Expression: FILL(byid, 0) + FILL(byarn, 0)
+          ReturnData: true
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+      OKActions: [!Ref AlarmTopic]
+
+  ProThrottlesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-bedrock-throttles-nova-pro"
+      AlarmDescription: Amazon Bedrock throttled Nova Pro calls. Response in README.
+      Namespace: AWS/Bedrock
+      MetricName: InvocationThrottles
+      Dimensions: [{ Name: ModelId, Value: !Ref ProModelId }]
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+      OKActions: [!Ref AlarmTopic]
+
 Outputs:
   SiteUrl:
     Description: Public app URL (CloudFront). API is same-origin under /runs.
@@ -639,3 +839,6 @@ Outputs:
     Value: !Ref TallyFunction
   RemindersArn:
     Value: !Ref Reminders
+  AlarmTopicArn:
+    Description: SNS topic for the stack's CloudWatch alarms
+    Value: !Ref AlarmTopic

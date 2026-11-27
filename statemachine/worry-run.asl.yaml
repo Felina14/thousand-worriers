@@ -597,6 +597,60 @@ States:
         ":pi": { N: "{% $string($tally.tokens.pro_in) %}" }
         ":po": { N: "{% $string($tally.tokens.pro_out) %}" }
     Output: "{% { 'run_id': $run_id, 'top5': $tally.result.top5.{ 'theme': name, 'count': count } } %}"
+    Next: ReadCounts
+
+  # ---- 6. Run health metrics (F01): lost worriers and tally fallback become CloudWatch metrics with alarms ----
+  # Published for every finished run, 0 included, so a quiet loss is never just a number in META.
+  ReadCounts:
+    Type: Task
+    Resource: arn:aws:states:::dynamodb:getItem
+    Arguments:
+      TableName: ${TableName}
+      Key:
+        pk: { S: "{% 'run#' & $run_id %}" }
+        sk: { S: META }
+      ConsistentRead: true
+      ProjectionExpression: "#n, #d"
+      ExpressionAttributeNames: { "#n": n, "#d": done }
+    Assign:
+      launched: "{% $exists($states.result.Item.n) ? $number($states.result.Item.n.N) : 0 %}"
+      saved: "{% $exists($states.result.Item.done) ? $number($states.result.Item.done.N) : 0 %}"
+    Output: "{% $states.input %}"
+    Catch:
+      - ErrorEquals: [States.ALL]
+        Output: "{% $states.input %}"
+        Next: RunHealthSkipped
+    Next: PublishRunHealth
+
+  PublishRunHealth:
+    Type: Task
+    Resource: arn:aws:states:::aws-sdk:cloudwatch:putMetricData
+    Arguments:
+      Namespace: ThousandWorriers
+      MetricData:
+        - MetricName: LostWorriers
+          Unit: Count
+          Value: "{% $max([0, $launched - $saved]) %}"
+          Dimensions: [{ Name: StackName, Value: ${StackName} }]
+        - MetricName: TallyFallback
+          Unit: Count
+          Value: "{% $string($tally.result.tally) = 'v1-fallback' ? 1 : 0 %}"
+          Dimensions: [{ Name: StackName, Value: ${StackName} }]
+    Retry:
+      - ErrorEquals: [States.ALL]
+        IntervalSeconds: 1
+        BackoffRate: 2
+        MaxAttempts: 3
+    Output: "{% $states.input %}"
+    Catch:
+      - ErrorEquals: [States.ALL]
+        Output: "{% $states.input %}"
+        Next: RunHealthSkipped
+    End: true
+
+  # Telemetry must never sink a finished run.
+  RunHealthSkipped:
+    Type: Pass
     End: true
 
   MarkFailed:

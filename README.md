@@ -108,6 +108,17 @@ python3 -m pytest -q tests
 
 The tests stub all Bedrock calls, so they cost nothing.
 
+### When an alarm fires
+
+The stack sends every alarm to one SNS topic. Its email subscription uses `ALARM_EMAIL` from `.env` (or `ALERT_EMAIL` when unset); confirm the subscription email once after the first deploy. One response per alarm:
+
+- **worry-run-failed**: open the failed execution in Step Functions, read the run's META `error`, and rerun the plan once the cause is fixed.
+- **lost-worriers**: a finished run saved fewer worriers than it launched; check the Map Run's failed items and Bedrock throttles in the same minute, and tell users the count shown is lower.
+- **tally-fallback**: the v2 tally hit an error (usually Nova throttling) and the run used v1; read the run's `tally_error` and rerun when Bedrock is quiet.
+- **tally-errors**: read the Tally Lambda log for the stack trace and fix or redeploy; the run is marked FAILED.
+- **tally-throttles**: the account Lambda concurrency limit (10) was hit; space out runs or request a concurrency increase.
+- **bedrock-throttles-nova-micro / -nova-lite / -nova-pro**: Nova requests were throttled (retries absorb some); if it repeats, slow new runs or request a quota increase for that model.
+
 ## Cost and speed
 
 A recorded production run on a database migration plan produced 900 worriers in 209.5 seconds and cost $0.060 in Bedrock inference. Its re-test took 112.9 seconds and cost $0.017. Between runs you pay only for storage; DynamoDB items expire after 30 days.

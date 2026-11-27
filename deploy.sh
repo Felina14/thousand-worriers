@@ -6,8 +6,9 @@ cd "$(dirname "$0")"
 # The budget-alert / reminder-sender email lives in an untracked .env (ALERT_EMAIL=...), never in git.
 [ -f .env ] && set -a && . ./.env && set +a
 : "${ALERT_EMAIL:?Set ALERT_EMAIL (a verified SES identity that also gets the \$5 budget alert), e.g. in .env}"
+ALARM_EMAIL="${ALARM_EMAIL:-$ALERT_EMAIL}"   # CloudWatch alarm emails (NoEcho parameter)
 sam build
-sam deploy --parameter-overrides "AlertEmail=$ALERT_EMAIL BudgetLimitUsd=5"
+sam deploy --parameter-overrides "AlertEmail=$ALERT_EMAIL BudgetLimitUsd=5 AlarmEmail=$ALARM_EMAIL"
 out() { aws cloudformation describe-stacks --stack-name thousand-worriers --region us-east-1 \
   --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text; }
 BUCKET=$(out BucketName); DIST=$(out DistributionId); URL=$(out SiteUrl)
